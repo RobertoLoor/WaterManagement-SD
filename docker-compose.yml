@@ -1,44 +1,52 @@
-# docker-compose.yml
-# Parte "Cloud" del sistema (obligatoria en Railway segun el enunciado):
-# Zookeeper + Kafka + WM_Central (que incluye la BD SQLite y el dashboard web).
+#  docker-compose.yml
+# Parte "Cloud" del sistema: Kafka (modo KRaft, sin Zookeeper) + WM_Central
+# (que incluye la BD SQLite y el dashboard web).
 #
 # Variables configurables por entorno (ver .env / panel de variables de Railway):
 #   KAFKA_EXTERNAL_HOST  -> dominio publico por el que WM_WS / WM_FO alcanzaran Kafka
 #   KAFKA_EXTERNAL_PORT  -> puerto publico (Railway TCP Proxy) para el listener EXTERNAL
 #   SOCKET_PORT          -> puerto de sockets de WM_Central (registro de estaciones)
 #   WEB_PORT             -> puerto del dashboard web de WM_Central
-version: '3.8'
 
 services:
-  zookeeper:
-    image: bitnamilegacy/zookeeper:latest
-    container_name: zookeeper
-    environment:
-      - ALLOW_ANONYMOUS_LOGIN=yes
-    ports:
-      - "2181:2181"
-    restart: unless-stopped
-
   kafka:
-    image: bitnamilegacy/kafka:latest
+    # Version fijada: 'latest' de bitnamilegacy es Kafka 4.x, que ya NO soporta Zookeeper.
+    image: bitnamilegacy/kafka:4.0.0-debian-12-r10
     container_name: kafka
     ports:
       - "9092:9092"
       - "9093:9093"
     environment:
-      - KAFKA_ENABLE_KRAFT=false
-      - KAFKA_CFG_BROKER_ID=1
-      - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
-      - ALLOW_PLAINTEXT_LISTENER=yes
-      - KAFKA_CFG_LISTENERS=PLAINTEXT://0.0.0.0:9092,EXTERNAL://0.0.0.0:9093
+      # --- KRaft (un unico nodo que es broker + controller) ---
+      - KAFKA_CFG_NODE_ID=1
+      - KAFKA_CFG_PROCESS_ROLES=controller,broker
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka:9094
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      # --- Listeners ---
+      # PLAINTEXT (9092): trafico interno entre contenedores
+      # EXTERNAL  (9093): acceso desde fuera (WM_WS / WM_FO)
+      # CONTROLLER(9094): solo uso interno de KRaft
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,EXTERNAL://:9093,CONTROLLER://:9094
       # OJO: en Railway, KAFKA_EXTERNAL_HOST/PORT deben ser el dominio/puerto
       # publico que asigna el TCP Proxy del servicio Kafka (no 127.0.0.1).
       - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,EXTERNAL://${KAFKA_EXTERNAL_HOST:-127.0.0.1}:${KAFKA_EXTERNAL_PORT:-9093}
-      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
-    depends_on:
-      - zookeeper
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - ALLOW_PLAINTEXT_LISTENER=yes
+      # Un solo nodo: los topicos internos no pueden tener factor de replicacion 3
+      - KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
+      - KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR=1
+    volumes:
+      - kafka_data:/bitnami/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
     restart: unless-stopped
-
+ 
   wm_central:
     build:
       context: .
@@ -55,8 +63,10 @@ services:
     volumes:
       - wm_central_data:/app/data
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
     restart: unless-stopped
-
+ 
 volumes:
   wm_central_data:
+  kafka_data:

@@ -2,7 +2,16 @@
 import json
 import time
 from kafka import KafkaProducer, KafkaConsumer
-from kafka.errors import NoBrokersAvailable
+
+# Manejo seguro para evitar el error: ImportError: cannot import name 'NoBrokersAvailable'
+try:
+    from kafka.errors import NoBrokersAvailable
+except ImportError:
+    try:
+        from kafka.errors import KafkaError as NoBrokersAvailable
+    except ImportError:
+        # Si por alguna razón extrema no existe, usamos Exception genérica como respaldo
+        NoBrokersAvailable = Exception
 
 # Topicos usados por todo el sistema (centralizados para evitar erratas)
 TOPIC_TELEMETRIA = "telemetria-riego"       # Engine -> Central
