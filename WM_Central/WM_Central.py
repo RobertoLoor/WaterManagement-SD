@@ -29,17 +29,21 @@ import time
 import uuid
 
 # --- localizar la raiz del proyecto (utils/ + .env) ------------------------
-dir_cursor = os.path.dirname(os.path.abspath(__file__))
+# --- localizar la raiz del proyecto (carpeta que contiene utils/) ---------
+_inicio = os.path.dirname(os.path.abspath(__file__))
+dir_cursor = _inicio
 while True:
-    utils_dir = os.path.join(dir_cursor, "utils")
-    env_file = os.path.join(dir_cursor, ".env")
-    if os.path.isdir(utils_dir) and os.path.isfile(env_file):
+    if os.path.isdir(os.path.join(dir_cursor, "utils")):
         if dir_cursor not in sys.path:
             sys.path.insert(0, dir_cursor)
         break
     parent = os.path.dirname(dir_cursor)
     if parent == dir_cursor:
-        raise RuntimeError("No se encontro la raiz del proyecto (utils/ + .env).")
+        raise RuntimeError(
+            f"No se encontro utils/. Inicio={_inicio} | "
+            f"contenido de {os.path.dirname(_inicio)}: "
+            f"{sorted(os.listdir(os.path.dirname(_inicio)))}"
+        )
     dir_cursor = parent
 
 from utils.protocol import (
