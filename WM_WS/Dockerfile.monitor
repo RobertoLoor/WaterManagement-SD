@@ -1,0 +1,16 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+EXPOSE 6001
+
+ENV PYTHONUNBUFFERED=1
+
+# ip_central, puerto_central, id_ws, ubicacion, puerto_engine y kafka_broker
+# se pasan como variables de entorno (ver docker-compose de laboratorio)
+CMD ["sh", "-c", "python WM_WS/WM_WS_M.py \"$CENTRAL_HOST\" \"$CENTRAL_PORT\" \"$WS_ID\" \"$WS_UBICACION\" \"$ENGINE_PORT\" \"$KAFKA_BROKER\""]

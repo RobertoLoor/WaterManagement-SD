@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WM_Central · WaterManagement</title>
+<style>
+  :root{
+    --bg:#0f172a; --panel:#111827; --text:#e5e7eb; --muted:#94a3b8;
+    --disponible:#16a34a; --regando:#22c55e; --fuga:#dc2626;
+    --fuera:#f59e0b; --desconectada:#6b7280; --border:#1f2937;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;font-family:Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--text);}
+  header{padding:16px 24px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;}
+  header h1{font-size:20px;margin:0;}
+  header span{color:var(--muted);font-size:13px;}
+  .resumen{display:flex;gap:10px;padding:12px 24px;flex-wrap:wrap;}
+  .chip{padding:6px 12px;border-radius:999px;font-size:13px;border:1px solid var(--border);background:var(--panel);}
+  main{padding:0 24px 24px;display:grid;grid-template-columns:2fr 1fr;gap:20px;}
+  @media (max-width:900px){main{grid-template-columns:1fr;}}
+  table{width:100%;border-collapse:collapse;background:var(--panel);border-radius:10px;overflow:hidden;}
+  th,td{padding:10px 12px;text-align:left;font-size:13px;border-bottom:1px solid var(--border);}
+  th{color:var(--muted);font-weight:600;text-transform:uppercase;font-size:11px;}
+  .badge{display:inline-block;padding:4px 10px;border-radius:6px;font-weight:600;font-size:12px;color:#fff;}
+  .DISPONIBLE{background:var(--disponible);}
+  .REGANDO{background:var(--regando);animation:parpadeo 1s infinite;}
+  .FUGA{background:var(--fuga);}
+  .FUERA_DE_SERVICIO{background:var(--fuera);color:#111;}
+  .DESCONECTADA{background:var(--desconectada);}
+  @keyframes parpadeo{0%,100%{opacity:1;}50%{opacity:0.45;}}
+  .acciones button{margin-right:4px;padding:5px 8px;border-radius:6px;border:1px solid var(--border);
+      background:#1e293b;color:var(--text);cursor:pointer;font-size:12px;}
+  .acciones button:hover{background:#334155;}
+  .log{background:var(--panel);border-radius:10px;padding:10px 14px;height:520px;overflow-y:auto;font-size:12px;}
+  .log div{padding:5px 0;border-bottom:1px solid var(--border);color:var(--muted);}
+  .log div b{color:var(--text);}
+  .panel-title{font-size:13px;color:var(--muted);text-transform:uppercase;margin:0 0 10px;}
+  input.num{width:64px;background:#0b1220;border:1px solid var(--border);color:var(--text);border-radius:6px;padding:4px;}
+</style>
+</head>
+<body>
+<header>
+  <h1>💧 WM_Central — Panel de monitorización</h1>
+  <span id="reloj"></span>
+</header>
+
+<div class="resumen" id="resumen"></div>
+
+<main>
+  <div>
+    <p class="panel-title">Estaciones de riego (WS)</p>
+    <table>
+      <thead>
+        <tr><th>ID</th><th>Ubicación</th><th>Estado</th><th>Caudal (L/min)</th><th>Vol. acum. (L)</th><th>Operario</th><th>Acciones</th></tr>
+      </thead>
+      <tbody id="tbody-estaciones"></tbody>
+    </table>
+  </div>
+  <div>
+    <p class="panel-title">Eventos del sistema</p>
+    <div class="log" id="log"></div>
+  </div>
+</main>
+
+<script>
+function fmt(ts){ return new Date(ts*1000).toLocaleTimeString(); }
+
+async function refrescar(){
+  try{
+    const res = await fetch('/api/state');
+    const data = await res.json();
+
+    document.getElementById('reloj').textContent = new Date().toLocaleString();
+
+    const resumen = data.resumen;
+    document.getElementById('resumen').innerHTML = Object.entries(resumen).map(
+      ([k,v]) => `<span class="chip">${k.replaceAll('_',' ')}: <b>${v}</b></span>`
+    ).join('');
+
+    const tbody = document.getElementById('tbody-estaciones');
+    tbody.innerHTML = data.estaciones.map(e => `
+      <tr>
+        <td>${e.id_ws}</td>
+        <td>${e.ubicacion || '-'}</td>
+        <td><span class="badge ${e.estado}">${e.estado.replaceAll('_',' ')}</span></td>
+        <td>${e.estado === 'REGANDO' ? (e.caudal ?? 0).toFixed(2) : '-'}</td>
+        <td>${e.estado === 'REGANDO' ? (e.volumen ?? 0).toFixed(2) : '-'}</td>
+        <td>${e.operario || '-'}</td>
+        <td class="acciones">
+          <button onclick="accion('${e.id_ws}','INICIAR')">Regar</button>
+          <button onclick="accion('${e.id_ws}','BLOQUEAR')">Bloquear</button>
+          <button onclick="accion('${e.id_ws}','ACTIVAR')">Activar</button>
+        </td>
+      </tr>`).join('');
+
+    document.getElementById('log').innerHTML = data.eventos.map(ev =>
+      `<div><b>${fmt(ev.timestamp)}</b> — ${ev.mensaje}</div>`
+    ).join('');
+  }catch(err){ console.error(err); }
+}
+
+async function accion(id_ws, accion){
+  let duracion_seg = 60;
+  if(accion === 'INICIAR'){
+    duracion_seg = parseInt(prompt('Duración del riego (segundos):', '60') || '60', 10);
+  }
+  await fetch('/api/action', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({accion, id_ws, duracion_seg})
+  });
+  refrescar();
+}
+
+setInterval(refrescar, 1000);
+refrescar();
+</script>
+</body>
+</html>

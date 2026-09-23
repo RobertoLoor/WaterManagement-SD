@@ -1,0 +1,83 @@
+# docker-compose.lab.yml
+# Ejecutar en el PC del laboratorio que hace de "PC LAB 2" (WS) segun la
+# Figura 4 del enunciado. Cada WS = 1 Monitor + 1 Engine.
+#
+# Antes de lanzarlo, copia .env.lab.example a .env.lab y rellena
+# CENTRAL_HOST / KAFKA_BROKER con los datos publicos de Railway.
+#
+# Uso:
+#   docker compose -f docker-compose.lab.yml --env-file .env.lab up -d ws01_monitor ws01_engine ws02_monitor ws02_engine
+#   docker compose -f docker-compose.lab.yml --env-file .env.lab run --rm fo1   (necesita -it para el menu)
+version: '3.8'
+
+services:
+
+  ws01_monitor:
+    build:
+      context: .
+      dockerfile: WM_WS/Dockerfile.monitor
+    container_name: ws01_monitor
+    environment:
+      - CENTRAL_HOST=${CENTRAL_HOST}
+      - CENTRAL_PORT=${CENTRAL_PORT}
+      - WS_ID=WS-01
+      - WS_UBICACION=River Park
+      - ENGINE_PORT=6001
+      - KAFKA_BROKER=${KAFKA_BROKER}
+    restart: unless-stopped
+
+  ws01_engine:
+    build:
+      context: .
+      dockerfile: WM_WS/Dockerfile.engine
+    container_name: ws01_engine
+    stdin_open: true
+    tty: true
+    environment:
+      - MONITOR_HOST=ws01_monitor
+      - MONITOR_PORT=6001
+      - KAFKA_BROKER=${KAFKA_BROKER}
+    depends_on:
+      - ws01_monitor
+    restart: unless-stopped
+
+  ws02_monitor:
+    build:
+      context: .
+      dockerfile: WM_WS/Dockerfile.monitor
+    container_name: ws02_monitor
+    environment:
+      - CENTRAL_HOST=${CENTRAL_HOST}
+      - CENTRAL_PORT=${CENTRAL_PORT}
+      - WS_ID=WS-02
+      - WS_UBICACION=Riverside Gardens
+      - ENGINE_PORT=6002
+      - KAFKA_BROKER=${KAFKA_BROKER}
+    restart: unless-stopped
+
+  ws02_engine:
+    build:
+      context: .
+      dockerfile: WM_WS/Dockerfile.engine
+    container_name: ws02_engine
+    stdin_open: true
+    tty: true
+    environment:
+      - MONITOR_HOST=ws02_monitor
+      - MONITOR_PORT=6002
+      - KAFKA_BROKER=${KAFKA_BROKER}
+    depends_on:
+      - ws02_monitor
+    restart: unless-stopped
+
+  fo1:
+    build:
+      context: .
+      dockerfile: WM_FO/Dockerfile
+    container_name: fo1
+    stdin_open: true
+    tty: true
+    environment:
+      - KAFKA_BROKER=${KAFKA_BROKER}
+      - OPERADOR_ID=FO-01
+      - ACTIVACIONES_FILE=WM_FO/activaciones_ejemplo.json

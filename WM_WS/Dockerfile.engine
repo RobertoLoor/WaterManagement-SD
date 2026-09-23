@@ -1,0 +1,14 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+ENV PYTHONUNBUFFERED=1
+
+# Consola interactiva (para simular fugas con 'k'/'o'): se ejecuta con
+# `docker compose run` o `docker run -it` para poder usar el teclado.
+CMD ["sh", "-c", "python WM_WS/WM_WS_E.py \"$MONITOR_HOST\" \"$MONITOR_PORT\" \"$KAFKA_BROKER\""]
