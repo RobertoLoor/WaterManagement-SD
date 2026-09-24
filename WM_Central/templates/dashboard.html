@@ -4,34 +4,51 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>WM_Central · WaterManagement</title>
+<!--
+  RESUMEN PARA ESTUDIAR
+  Esta es la pagina del panel de CENTRAL. Flask la sirve en "/".
+  Cada segundo el JavaScript de abajo pide los datos a /api/state (JSON) y vuelve
+  a dibujar la tabla de estaciones, el resumen de estados y el log de eventos.
+  Los botones (Regar / Bloquear / Activar) envian una orden a /api/action.
+  Ubicacion en el proyecto: WM_Central/templates/dashboard.html
+-->
 <style>
+  /* Variables CSS: colores definidos una vez y reutilizados con var(--nombre). */
   :root{
     --bg:#0f172a; --panel:#111827; --text:#e5e7eb; --muted:#94a3b8;
     --disponible:#16a34a; --regando:#22c55e; --fuga:#dc2626;
     --fuera:#f59e0b; --desconectada:#6b7280; --border:#1f2937;
   }
+  /* box-sizing:border-box hace que padding y borde cuenten dentro del ancho. */
   *{box-sizing:border-box;}
   body{margin:0;font-family:Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--text);}
+  /* Cabecera: titulo a la izquierda y reloj a la derecha (flex). */
   header{padding:16px 24px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;}
   header h1{font-size:20px;margin:0;}
   header span{color:var(--muted);font-size:13px;}
+  /* Fila de "chips" con el numero de estaciones por estado. */
   .resumen{display:flex;gap:10px;padding:12px 24px;flex-wrap:wrap;}
   .chip{padding:6px 12px;border-radius:999px;font-size:13px;border:1px solid var(--border);background:var(--panel);}
+  /* Cuerpo: 2 columnas (tabla 2/3 y eventos 1/3). En pantallas estrechas pasa a 1 columna. */
   main{padding:0 24px 24px;display:grid;grid-template-columns:2fr 1fr;gap:20px;}
   @media (max-width:900px){main{grid-template-columns:1fr;}}
   table{width:100%;border-collapse:collapse;background:var(--panel);border-radius:10px;overflow:hidden;}
   th,td{padding:10px 12px;text-align:left;font-size:13px;border-bottom:1px solid var(--border);}
   th{color:var(--muted);font-weight:600;text-transform:uppercase;font-size:11px;}
+  /* Etiqueta de estado. La clase CSS coincide con el nombre del estado en la BD. */
   .badge{display:inline-block;padding:4px 10px;border-radius:6px;font-weight:600;font-size:12px;color:#fff;}
   .DISPONIBLE{background:var(--disponible);}
+  /* REGANDO parpadea con una animacion para llamar la atencion. */
   .REGANDO{background:var(--regando);animation:parpadeo 1s infinite;}
   .FUGA{background:var(--fuga);}
   .FUERA_DE_SERVICIO{background:var(--fuera);color:#111;}
   .DESCONECTADA{background:var(--desconectada);}
   @keyframes parpadeo{0%,100%{opacity:1;}50%{opacity:0.45;}}
+  /* Botones de accion de cada fila. */
   .acciones button{margin-right:4px;padding:5px 8px;border-radius:6px;border:1px solid var(--border);
       background:#1e293b;color:var(--text);cursor:pointer;font-size:12px;}
   .acciones button:hover{background:#334155;}
+  /* Caja de eventos con scroll vertical propio. */
   .log{background:var(--panel);border-radius:10px;padding:10px 14px;height:520px;overflow-y:auto;font-size:12px;}
   .log div{padding:5px 0;border-bottom:1px solid var(--border);color:var(--muted);}
   .log div b{color:var(--text);}
@@ -42,11 +59,13 @@
 <body>
 <header>
   <h1>💧 WM_Central — Panel de monitorización</h1>
+  <!-- El reloj lo rellena el JavaScript (id="reloj"). -->
   <span id="reloj"></span>
 </header>
-
+ 
+<!-- Aqui el JS pinta las "chips" con el conteo de estaciones por estado. -->
 <div class="resumen" id="resumen"></div>
-
+ 
 <main>
   <div>
     <p class="panel-title">Estaciones de riego (WS)</p>
@@ -54,30 +73,42 @@
       <thead>
         <tr><th>ID</th><th>Ubicación</th><th>Estado</th><th>Caudal (L/min)</th><th>Vol. acum. (L)</th><th>Operario</th><th>Acciones</th></tr>
       </thead>
+      <!-- El cuerpo de la tabla se genera dinamicamente con JavaScript. -->
       <tbody id="tbody-estaciones"></tbody>
     </table>
   </div>
   <div>
     <p class="panel-title">Eventos del sistema</p>
+    <!-- Lista de eventos recientes, tambien generada con JavaScript. -->
     <div class="log" id="log"></div>
   </div>
 </main>
-
+ 
 <script>
+// Convierte un timestamp Unix (segundos) en hora legible. JavaScript usa
+// milisegundos, de ahi el "* 1000".
 function fmt(ts){ return new Date(ts*1000).toLocaleTimeString(); }
-
+ 
+// Pide el estado al servidor y redibuja todo el panel. Se ejecuta cada segundo.
 async function refrescar(){
   try{
+    // GET /api/state -> JSON { estaciones, eventos, resumen } (ver dashboard.py).
     const res = await fetch('/api/state');
     const data = await res.json();
-
+ 
+    // Actualiza el reloj de la cabecera.
     document.getElementById('reloj').textContent = new Date().toLocaleString();
-
+ 
+    // Chips del resumen: una por cada estado ("FUERA_DE_SERVICIO" -> "FUERA DE SERVICIO").
     const resumen = data.resumen;
     document.getElementById('resumen').innerHTML = Object.entries(resumen).map(
       ([k,v]) => `<span class="chip">${k.replaceAll('_',' ')}: <b>${v}</b></span>`
     ).join('');
-
+ 
+    // Tabla de estaciones: una fila (<tr>) por estacion.
+    // - El badge usa como clase CSS el propio estado para colorearse.
+    // - Caudal y volumen solo se muestran si esta REGANDO; si no, un guion.
+    // - Los botones llaman a accion(id, 'INICIAR' | 'BLOQUEAR' | 'ACTIVAR').
     const tbody = document.getElementById('tbody-estaciones');
     tbody.innerHTML = data.estaciones.map(e => `
       <tr>
@@ -93,25 +124,31 @@ async function refrescar(){
           <button onclick="accion('${e.id_ws}','ACTIVAR')">Activar</button>
         </td>
       </tr>`).join('');
-
+ 
+    // Log de eventos: hora en negrita + mensaje.
     document.getElementById('log').innerHTML = data.eventos.map(ev =>
       `<div><b>${fmt(ev.timestamp)}</b> — ${ev.mensaje}</div>`
     ).join('');
-  }catch(err){ console.error(err); }
+  }catch(err){ console.error(err); }  // si falla la red, se anota en consola y se reintenta al siguiente ciclo
 }
-
+ 
+// Se ejecuta al pulsar un boton: envia la orden al servidor.
 async function accion(id_ws, accion){
   let duracion_seg = 60;
+  // Para regar se pregunta la duracion (por defecto 60 s).
   if(accion === 'INICIAR'){
     duracion_seg = parseInt(prompt('Duración del riego (segundos):', '60') || '60', 10);
   }
+  // POST /api/action con el cuerpo en JSON (lo recibe api_action() en dashboard.py).
   await fetch('/api/action', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({accion, id_ws, duracion_seg})
   });
+  // Actualizamos ya, sin esperar al siguiente ciclo de 1 s.
   refrescar();
 }
-
+ 
+// Polling: llamada cada 1000 ms + una primera llamada inmediata al cargar la pagina.
 setInterval(refrescar, 1000);
 refrescar();
 </script>

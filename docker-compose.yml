@@ -1,6 +1,8 @@
-#  docker-compose.yml
+# docker-compose.yml
 # Parte "Cloud" del sistema: Kafka (modo KRaft, sin Zookeeper) + WM_Central
 # (que incluye la BD SQLite y el dashboard web).
+# Sirve para probar TODO en local con: docker compose up --build
+# (En Railway no se usa este fichero: alli cada servicio se crea a mano.)
 #
 # Variables configurables por entorno (ver .env / panel de variables de Railway):
 #   KAFKA_EXTERNAL_HOST  -> dominio publico por el que WM_WS / WM_FO alcanzaran Kafka
@@ -13,13 +15,16 @@ services:
     # Version fijada: 'latest' de bitnamilegacy es Kafka 4.x, que ya NO soporta Zookeeper.
     image: bitnamilegacy/kafka:4.0.0-debian-12-r10
     container_name: kafka
+    # "puerto_del_PC:puerto_del_contenedor". 9092 = interno, 9093 = para clientes del PC.
     ports:
       - "9092:9092"
       - "9093:9093"
     environment:
       # --- KRaft (un unico nodo que es broker + controller) ---
+      # KRaft = Kafka gestiona su propio metadata, sin Zookeeper.
       - KAFKA_CFG_NODE_ID=1
       - KAFKA_CFG_PROCESS_ROLES=controller,broker
+      # Quien vota en el quorum del controller: solo el nodo 1, en el puerto 9094.
       - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka:9094
       - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
       # --- Listeners ---
@@ -27,46 +32,61 @@ services:
       # EXTERNAL  (9093): acceso desde fuera (WM_WS / WM_FO)
       # CONTROLLER(9094): solo uso interno de KRaft
       - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,EXTERNAL://:9093,CONTROLLER://:9094
+      # ADVERTISED_LISTENERS = la direccion que Kafka le DICE al cliente que use despues
+      # de conectar. Si es incorrecta, el cliente conecta una vez y falla despues.
       # OJO: en Railway, KAFKA_EXTERNAL_HOST/PORT deben ser el dominio/puerto
       # publico que asigna el TCP Proxy del servicio Kafka (no 127.0.0.1).
       - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,EXTERNAL://${KAFKA_EXTERNAL_HOST:-127.0.0.1}:${KAFKA_EXTERNAL_PORT:-9093}
+      # Protocolo de cada listener (aqui todos sin cifrado ni autenticacion).
       - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      # Listener que usan los brokers entre si.
       - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      # Permite listeners sin cifrar (no recomendable en produccion).
       - ALLOW_PLAINTEXT_LISTENER=yes
       # Un solo nodo: los topicos internos no pueden tener factor de replicacion 3
       - KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR=1
       - KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
       - KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR=1
+    # Volumen para conservar los topics y mensajes entre reinicios.
     volumes:
       - kafka_data:/bitnami/kafka
+    # Comprueba cada 10 s que Kafka responde (lista los topics). Mientras no lo haga,
+    # el servicio esta "starting"; wm_central espera a que este "healthy".
     healthcheck:
       test: ["CMD-SHELL", "/opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
       interval: 10s
       timeout: 10s
       retries: 12
       start_period: 20s
+    # Reinicia el contenedor si se cae (salvo que lo pares tu a mano).
     restart: unless-stopped
  
   wm_central:
+    # Se construye desde el Dockerfile del repo (contexto = raiz, para tener utils/).
     build:
       context: .
       dockerfile: WM_Central/Dockerfile
     container_name: wm_central
+    # ${VAR:-defecto}: usa la variable del .env o, si no existe, el valor por defecto.
     ports:
       - "${SOCKET_PORT:-5000}:5000"
       - "${WEB_PORT:-8080}:8080"
     environment:
       - SOCKET_PORT=5000
       - WEB_PORT=8080
+      # Dentro de la red de Docker, Kafka se ve por el nombre del servicio: "kafka".
       - KAFKA_BROKER=kafka:9092
       - DB_PATH=/app/data/wm_central.db
+    # Volumen para que la base de datos SQLite persista.
     volumes:
       - wm_central_data:/app/data
+    # No arranca hasta que Kafka pase el healthcheck.
     depends_on:
       kafka:
         condition: service_healthy
     restart: unless-stopped
  
+# Volumenes con nombre: Docker guarda su contenido aunque se borren los contenedores.
 volumes:
   wm_central_data:
   kafka_data:

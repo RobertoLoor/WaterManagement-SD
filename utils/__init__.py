@@ -1,0 +1,1 @@
+# Este archivo se utiliza para marcar el directorio como un paquete de Python. No contiene código ejecutable, pero permite que los módulos dentro del directorio sean importados correctamente.

@@ -12,35 +12,43 @@ version: '3.8'
 
 services:
 
+  # ---- Estacion WS-01: Monitor ----
   ws01_monitor:
     build:
       context: .
       dockerfile: WM_WS/Dockerfile.monitor
     container_name: ws01_monitor
     environment:
+      # Donde esta WM_Central (proxy publico de Railway) y como se llama esta estacion.
       - CENTRAL_HOST=${CENTRAL_HOST}
       - CENTRAL_PORT=${CENTRAL_PORT}
       - WS_ID=WS-01
       - WS_UBICACION=River Park
+      # Puerto en el que este Monitor espera a SU Engine (distinto en cada estacion).
       - ENGINE_PORT=6001
       - KAFKA_BROKER=${KAFKA_BROKER}
     restart: unless-stopped
 
+  # ---- Estacion WS-01: Engine ----
   ws01_engine:
     build:
       context: .
       dockerfile: WM_WS/Dockerfile.engine
     container_name: ws01_engine
+    # stdin_open + tty = consola interactiva, necesaria para pulsar 'k'/'o' (simular fugas).
     stdin_open: true
     tty: true
     environment:
+      # Dentro de la red de Docker, el Monitor se ve por el nombre de su servicio.
       - MONITOR_HOST=ws01_monitor
       - MONITOR_PORT=6001
       - KAFKA_BROKER=${KAFKA_BROKER}
+    # Arranca despues del Monitor (aunque no espera a que este "listo").
     depends_on:
       - ws01_monitor
     restart: unless-stopped
 
+  # ---- Estacion WS-02: identica a WS-01 pero con otro id, ubicacion y puerto ----
   ws02_monitor:
     build:
       context: .
@@ -70,6 +78,7 @@ services:
       - ws02_monitor
     restart: unless-stopped
 
+  # ---- Operario de campo (WM_FO): programa con menu interactivo ----
   fo1:
     build:
       context: .
@@ -79,5 +88,6 @@ services:
     tty: true
     environment:
       - KAFKA_BROKER=${KAFKA_BROKER}
+      # Identificador del operario y fichero JSON con la lista de activaciones.
       - OPERADOR_ID=FO-01
       - ACTIVACIONES_FILE=WM_FO/activaciones_ejemplo.json

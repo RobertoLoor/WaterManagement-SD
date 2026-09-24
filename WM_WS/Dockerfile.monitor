@@ -1,14 +1,19 @@
+# Imagen del MONITOR de una estacion (WM_WS_M.py).
 FROM python:3.11-slim
 
 WORKDIR /app
 
+# Dependencias (paso cacheable).
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Codigo del proyecto.
 COPY . .
 
+# Documenta el puerto en el que el Monitor espera al Engine (por defecto 6001).
 EXPOSE 6001
 
+# Logs sin buffer.
 ENV PYTHONUNBUFFERED=1
 
 # ip_central, puerto_central, id_ws, ubicacion, puerto_engine y kafka_broker

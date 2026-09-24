@@ -1,3 +1,14 @@
+# Dependencias de Python del proyecto (se instalan con: pip install -r requirements.txt)
+# En Docker las instala el Dockerfile; en tu PC las instalas tu.
+
+# Cliente de Kafka. IMPORTANTE: es un fork de "kafka-python". Ambos paquetes usan el
+# mismo nombre de modulo ("kafka"), asi que NO deben instalarse a la vez: se pisan los
+# ficheros y aparece el error "cannot import name 'classproperty'".
 kafka-python-ng
+
+# Carga variables desde ficheros .env. Nota: en el codigo actual NO se usa
+# (los .env solo se leen con "--env-file" de docker compose), asi que podria quitarse.
 python-dotenv
+
+# Framework web ligero: sirve el dashboard de WM_Central.
 Flask

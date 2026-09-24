@@ -1,4 +1,4 @@
-@echo off
+@echo off 
 REM ============================================================
 REM  Lanza WM_Central sin Docker (util en desarrollo/pruebas locales,
 REM  cuando Kafka ya esta corriendo, por ejemplo via docker-compose.yml).

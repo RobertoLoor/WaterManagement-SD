@@ -19,7 +19,22 @@ import time
 import uuid
 import threading
 
+# ---------------------------------------------------------------------------
+# VISION GENERAL PARA ESTUDIAR
+# ---------------------------------------------------------------------------
+# WM_FO solo habla con CENTRAL a traves de KAFKA (no usa sockets):
+#
+#   ESCRIBE  en 'riego-peticiones'  -> pide regar una estacion
+#   LEE      de 'central-broadcast' -> estado de todas las estaciones (cada 2 s)
+#   LEE      de 'riego-respuestas'  -> AUTORIZADO / DENEGADO / RESUMEN / INTERRUMPIDO
+#
+# Hilos: el principal muestra el menu; hilo_broadcast y hilo_respuestas corren de fondo.
+# El "request_id" (UUID) une cada peticion con su respuesta.
+# ---------------------------------------------------------------------------
+
 # --- localizar la raiz del proyecto (carpeta que contiene utils/) ---------
+# Sube de carpeta hasta encontrar 'utils' y la anade al sys.path (asi funcionan
+# los imports "from utils...." aunque el script viva en WM_FO/).
 _inicio = os.path.dirname(os.path.abspath(__file__))
 dir_cursor = _inicio
 while True:
@@ -41,18 +56,25 @@ from utils.kafka_utils import (
     TOPIC_PETICIONES, TOPIC_RESPUESTAS, TOPIC_BROADCAST,
 )
 
+# Ultimo estado conocido de cada estacion (lo rellena hilo_broadcast).
 estaciones_conocidas = {}          # id_ws -> dict con su ultimo estado conocido
 lock_estaciones = threading.Lock()
 
+# Peticiones enviadas que esperan respuesta (solo se usa en el modo fichero).
+# Cada una lleva un threading.Event: el hilo del fichero se bloquea en .wait() y
+# el hilo de respuestas lo libera con .set() cuando llega la respuesta final.
 resultados_pendientes = {}         # request_id -> {"event":..., "resultado": None}
 lock_resultados = threading.Lock()
 
 
 def hilo_broadcast(kafka_broker):
     """Mantiene actualizado el listado de todas las WS (disponibles o no)."""
+    # group_id=None: no se guarda progreso en Kafka; con desde_inicio=False solo
+    # llegan mensajes nuevos. Nos basta: el broadcast se repite cada 2 s.
     consumidor = crear_consumidor(TOPIC_BROADCAST, kafka_broker, group_id=None)
     while True:
         for msg in consumidor:
+            # Cada mensaje trae la lista completa de estaciones; la guardamos por id.
             with lock_estaciones:
                 for e in msg.value.get("estaciones", []):
                     estaciones_conocidas[e["id_ws"]] = e
@@ -61,16 +83,20 @@ def hilo_broadcast(kafka_broker):
 
 def hilo_respuestas(kafka_broker, id_operador):
     """Escucha las respuestas de CENTRAL dirigidas a este operario."""
+    # group_id UNICO por ejecucion (uuid): asi cada WM_FO recibe TODAS las respuestas.
+    # Si varios FO compartieran group_id, Kafka repartiria los mensajes entre ellos.
     consumidor = crear_consumidor(TOPIC_RESPUESTAS, kafka_broker, group_id=f"fo-{id_operador}-{uuid.uuid4()}")
     while True:
         for msg in consumidor:
             data = msg.value
+            # El topic es compartido por todos los operarios: ignoramos lo que no es nuestro.
             if data.get("id_operador") != id_operador:
                 continue
 
             evento = data.get("evento")
             id_ws = data.get("id_ws")
 
+            # Mostramos por pantalla lo que dice CENTRAL segun el tipo de evento.
             if evento == "AUTORIZADO":
                 print(f"\n[CENTRAL] Riego AUTORIZADO en {id_ws}. {data.get('motivo', '')}")
             elif evento == "DENEGADO":
@@ -82,11 +108,13 @@ def hilo_respuestas(kafka_broker, id_operador):
                       f"Volumen total: {data.get('volumen_total_l', 0)} L, "
                       f"duracion: {data.get('duracion_seg', 0)} s.")
 
+            # Si alguien esta esperando esta respuesta (modo fichero), lo despertamos.
             request_id = data.get("request_id")
             with lock_resultados:
                 pendiente = resultados_pendientes.get(request_id)
             if pendiente and evento in ("AUTORIZADO", "DENEGADO", "RESUMEN", "INTERRUMPIDO"):
                 # Solo las respuestas "terminales" liberan la espera del modo fichero
+                # (AUTORIZADO no: hay que esperar a que el riego acabe con RESUMEN).
                 if evento in ("DENEGADO", "RESUMEN", "INTERRUMPIDO"):
                     pendiente["resultado"] = data
                     pendiente["event"].set()
@@ -94,11 +122,13 @@ def hilo_respuestas(kafka_broker, id_operador):
 
 
 def solicitar_riego(productor, id_operador, id_ws, duracion_seg, esperar_resultado=False, timeout=None):
+    # Cada peticion lleva un identificador unico para casar luego la respuesta.
     request_id = str(uuid.uuid4())
     evento_resultado = threading.Event()
     with lock_resultados:
         resultados_pendientes[request_id] = {"event": evento_resultado, "resultado": None}
 
+    # Publicamos la peticion en Kafka; CENTRAL la leera en hilo_peticiones().
     productor.send(TOPIC_PETICIONES, key=id_operador, value={
         "tipo": "SOLICITUD_RIEGO", "request_id": request_id, "id_operador": id_operador,
         "id_ws": id_ws, "duracion_seg": duracion_seg, "timestamp": time.time(),
@@ -106,6 +136,7 @@ def solicitar_riego(productor, id_operador, id_ws, duracion_seg, esperar_resulta
     productor.flush()
     print(f"[FO {id_operador}] Peticion enviada: activar {id_ws} durante {duracion_seg}s.")
 
+    # Modo bloqueante (fichero): esperamos a la respuesta final o al timeout.
     if esperar_resultado:
         evento_resultado.wait(timeout=timeout)
         with lock_resultados:
@@ -115,10 +146,12 @@ def solicitar_riego(productor, id_operador, id_ws, duracion_seg, esperar_resulta
 
 
 def mostrar_estaciones():
+    # Imprime una tabla con lo ultimo recibido por el broadcast de CENTRAL.
     with lock_estaciones:
         if not estaciones_conocidas:
             print("(Aun no se ha recibido informacion de CENTRAL. Espera unos segundos...)")
             return
+        # Cabecera con anchos fijos (<10 = alineado a la izquierda en 10 caracteres).
         print(f"\n{'ID':<10}{'UBICACION':<25}{'ESTADO':<20}{'CAUDAL':<10}{'VOLUMEN':<10}{'OPERARIO':<10}")
         for e in sorted(estaciones_conocidas.values(), key=lambda x: x["id_ws"]):
             print(f"{e['id_ws']:<10}{(e.get('ubicacion') or '-'):<25}{e['estado']:<20}"
@@ -127,24 +160,29 @@ def mostrar_estaciones():
 
 
 def ejecutar_fichero(productor, id_operador, ruta_fichero):
+    # El JSON es una lista: [{"id_ws": "WS-01", "duracion_seg": 20}, ...]
     with open(ruta_fichero, "r", encoding="utf-8") as f:
         activaciones = json.load(f)
 
     print(f"[FO {id_operador}] Cargadas {len(activaciones)} activaciones desde '{ruta_fichero}'.")
+    # Se ejecutan una a una: se espera el resultado de cada riego antes de seguir.
     for i, act in enumerate(activaciones, start=1):
         id_ws = act["id_ws"]
         duracion = act.get("duracion_seg", 60)
         print(f"\n[FO {id_operador}] ({i}/{len(activaciones)}) Solicitando activacion de {id_ws}...")
+        # timeout = duracion + 30 s de margen por si CENTRAL no responde.
         resultado = solicitar_riego(productor, id_operador, id_ws, duracion,
                                      esperar_resultado=True, timeout=duracion + 30)
         if resultado is None:
             print(f"[FO {id_operador}] Sin respuesta de CENTRAL para {id_ws} (timeout).")
+        # Pausa de 4 s entre peticiones, como pide el enunciado.
         print(f"[FO {id_operador}] Esperando 4s antes de la siguiente peticion...")
         time.sleep(4)
     print(f"[FO {id_operador}] Fichero de activaciones completado.")
 
 
 def menu(productor, id_operador, ruta_fichero_defecto=None):
+    # Bucle infinito del menu interactivo (input() bloquea hasta que escribes).
     while True:
         print("\n===== WM_FO - Menu del operario =====")
         print("1) Ver estaciones (disponibles y su estado)")
@@ -158,9 +196,11 @@ def menu(productor, id_operador, ruta_fichero_defecto=None):
         elif opcion == "2":
             id_ws = input("Id de la estacion (ej. WS-01): ").strip()
             try:
+                # Si se deja vacio, se usa 60; si no es un numero, tambien 60.
                 duracion = int(input("Duracion del riego en segundos [60]: ").strip() or "60")
             except ValueError:
                 duracion = 60
+            # Sin esperar_resultado: la respuesta se imprime sola desde hilo_respuestas.
             solicitar_riego(productor, id_operador, id_ws, duracion)
         elif opcion == "3":
             ruta = input(f"Ruta del fichero JSON [{ruta_fichero_defecto or 'activaciones.json'}]: ").strip()
@@ -171,12 +211,14 @@ def menu(productor, id_operador, ruta_fichero_defecto=None):
                 print(f"No se encontro el fichero '{ruta}'.")
         elif opcion == "4":
             print("Hasta luego.")
+            # os._exit termina en seco (incluidos los hilos daemon de fondo).
             os._exit(0)
         else:
             print("Opcion no valida.")
 
 
 if __name__ == "__main__":
+    # Parametros: argumento de linea de comandos -> variable de entorno -> valor por defecto.
     kafka_broker = sys.argv[1] if len(sys.argv) > 1 else os.getenv("KAFKA_BROKER", "localhost:9093")
     id_operador = sys.argv[2] if len(sys.argv) > 2 else os.getenv("OPERADOR_ID", "FO-01")
     ruta_fichero = sys.argv[3] if len(sys.argv) > 3 else os.getenv("ACTIVACIONES_FILE")
@@ -184,6 +226,7 @@ if __name__ == "__main__":
     print(f"[FO {id_operador}] Conectando a Kafka ({kafka_broker})...")
     productor = crear_productor(kafka_broker)
 
+    # Hilos de fondo: reciben el estado global y las respuestas mientras el menu espera.
     threading.Thread(target=hilo_broadcast, args=(kafka_broker,), daemon=True).start()
     threading.Thread(target=hilo_respuestas, args=(kafka_broker, id_operador), daemon=True).start()
 

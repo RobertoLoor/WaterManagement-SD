@@ -1,14 +1,19 @@
+# Imagen del ENGINE de una estacion (WM_WS_E.py).
 FROM python:3.11-slim
 
 WORKDIR /app
 
+# Dependencias (paso cacheable).
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Codigo del proyecto.
 COPY . .
 
+# Logs sin buffer.
 ENV PYTHONUNBUFFERED=1
 
 # Consola interactiva (para simular fugas con 'k'/'o'): se ejecuta con
 # `docker compose run` o `docker run -it` para poder usar el teclado.
+# Variables: MONITOR_HOST / MONITOR_PORT (donde esta su Monitor) y KAFKA_BROKER.
 CMD ["sh", "-c", "python WM_WS/WM_WS_E.py \"$MONITOR_HOST\" \"$MONITOR_PORT\" \"$KAFKA_BROKER\""]
