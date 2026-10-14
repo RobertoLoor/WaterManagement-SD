@@ -1,0 +1,13 @@
+# Lo que NO se copia dentro de las imagenes Docker (COPY . .)
+.git
+.gitignore
+.venv
+venv
+**/__pycache__
+*.pyc
+*.db
+.env
+.env.lab
+scripts
+README.md
+GUIA_USO.md

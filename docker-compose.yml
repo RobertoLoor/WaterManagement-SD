@@ -47,6 +47,12 @@ services:
       - KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR=1
       - KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
       - KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR=1
+      # Retencion corta: la telemetria se consume en tiempo real, no hace falta guardarla.
+      # Kafka solo borra segmentos CERRADOS, por eso tambien se fuerza que se cierren
+      # cada 10 min; sin esto (por defecto 7 dias / 1 GB) el volumen crece sin parar.
+      - KAFKA_CFG_LOG_RETENTION_MINUTES=60
+      - KAFKA_CFG_LOG_ROLL_MS=600000
+      - KAFKA_CFG_LOG_RETENTION_CHECK_INTERVAL_MS=60000
     # Volumen para conservar los topics y mensajes entre reinicios.
     volumes:
       - kafka_data:/bitnami/kafka

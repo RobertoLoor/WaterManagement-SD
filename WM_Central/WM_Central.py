@@ -20,6 +20,9 @@ Uso:
  
 Variables de entorno equivalentes (usadas por defecto si no hay argumentos,
 utiles para Docker): SOCKET_PORT, KAFKA_BROKER, WEB_PORT, DB_PATH
+
+El puerto del dashboard web se toma de: argumento -> PORT (la variable que
+asigna Railway) -> WEB_PORT -> 8080.
 """
 import os
 import sys
@@ -87,6 +90,13 @@ ESTADOS_QUE_PERMITEN_RIEGO = {"DISPONIBLE"}
 # Riegos en curso en memoria: clave = id de la estacion. Guarda quien lo pidio
 # y con que request_id, para poder responderle luego (resumen o interrupcion).
 riegos_activos = {}   # id_ws -> {request_id, id_operador, duracion_seg}
+# Conexion de socket abierta de cada Monitor: id_ws -> socket. Mientras siga abierta
+# y el Monitor mande latidos (ENQ), la estacion esta conectada; si se cierra o
+# enmudece, CENTRAL la marca DESCONECTADA.
+conexiones_ws = {}
+# Segundos sin recibir nada de un Monitor tras los cuales se le da por desconectado
+# (el Monitor manda un latido ENQ cada 5 s).
+TIMEOUT_MONITOR = 15
 # Lock para proteger 'riegos_activos', que tocan varios hilos a la vez.
 lock_riegos = threading.Lock()
  
@@ -99,11 +109,12 @@ productor = None
 def atender_monitor(conn, addr):
     """Atiende la conexion de un Monitor (WM_WS_M): ENQ -> ACK, registro -> alta en BD."""
     print(f"[SOCKET] Nueva conexion de Monitor desde {addr}")
+    id_registrado = None   # id de la estacion que se registro por ESTA conexion
     try:
         while True:
             # Lee una trama completa (o un caracter de control). Si el Monitor no
-            # manda nada en 120 s salta socket.timeout (se captura mas abajo).
-            datos = recv_exact_frame(conn, timeout=120)
+            # manda nada en TIMEOUT_MONITOR s salta socket.timeout (se captura mas abajo).
+            datos = recv_exact_frame(conn, timeout=TIMEOUT_MONITOR)
             if not datos:
                 # Cadena vacia = el Monitor cerro la conexion.
                 print(f"[SOCKET] Monitor {addr} desconectado.")
@@ -138,7 +149,10 @@ def atender_monitor(conn, addr):
                 id_ws = partes[1] if len(partes) > 1 else "WS-DESCONOCIDA"
                 ubicacion = partes[2] if len(partes) > 2 else "DESCONOCIDA"
                 db.upsert_estacion_registro(id_ws, ubicacion)
-                db.log_evento(f"{id_ws} registrada/conectada en '{ubicacion}'.")
+                db.log_evento(f"{id_ws} registrada en '{ubicacion}' (a la espera de su Engine).")
+                # La conexion queda abierta: es la que indica que la estacion esta viva.
+                id_registrado = id_ws
+                conexiones_ws[id_ws] = conn
                 # Respondemos al Monitor con otra trama: REGISTRO_OK#WS-01
                 respuesta = empaquetar_trama(f"REGISTRO_OK#{id_ws}")
                 conn.sendall(respuesta)
@@ -151,6 +165,11 @@ def atender_monitor(conn, addr):
     finally:
         # Pase lo que pase, cerramos el socket de este cliente.
         conn.close()
+        # Si era la conexion vigente de una estacion, esa estacion queda DESCONECTADA.
+        # (Si el Monitor ya se reconecto con otra conexion, no se toca.)
+        if id_registrado and conexiones_ws.get(id_registrado) is conn:
+            conexiones_ws.pop(id_registrado, None)
+            tratar_desconexion(id_registrado, "El Monitor ha perdido la conexion con CENTRAL.")
  
  
 def servidor_sockets(puerto: int):
@@ -210,6 +229,9 @@ def hilo_peticiones(broker: str):
             duracion = data.get("duracion_seg", 60)
             # Si el operario no manda request_id, se genera uno unico (UUID).
             request_id = data.get("request_id", str(uuid.uuid4()))
+            # Alta del operario en la BD la primera vez que aparece (tabla 'operarios').
+            if id_operador:
+                db.upsert_operario(id_operador)
  
             # Consultamos el estado actual de la estacion y si ya hay un riego en curso.
             estacion = db.get_estacion(id_ws)
@@ -291,6 +313,19 @@ def hilo_telemetria(broker: str):
         time.sleep(0.2)
  
  
+def tratar_desconexion(id_ws: str, motivo: str):
+    """Pasa la estacion a DESCONECTADA y, si estaba regando, avisa al operario."""
+    with lock_riegos:
+        info_riego = riegos_activos.pop(id_ws, None)
+    db.marcar_desconectada(id_ws)
+    db.log_evento(f"{id_ws} se ha desconectado de CENTRAL. {motivo}")
+    if info_riego:
+        responder_operario(info_riego["id_operador"], {
+            "request_id": info_riego["request_id"], "id_ws": id_ws,
+            "evento": "INTERRUMPIDO", "motivo": "La estacion se ha desconectado.",
+        })
+
+
 def hilo_estado_ws(broker: str):
     """Escucha eventos de salud (fuga/desconexion) enviados por los Monitores (WM_WS_M)."""
     consumidor = crear_consumidor(TOPIC_ESTADO_WS, broker, group_id="central-estado-ws")
@@ -326,16 +361,9 @@ def hilo_estado_ws(broker: str):
                 db.log_evento(f"Averia resuelta en {id_ws}. Estacion disponible de nuevo.")
  
             elif evento == "DESCONECTADO":
-                # El Monitor se cayo: DESCONECTADA y, si habia riego, se avisa al operario.
-                db.marcar_desconectada(id_ws)
-                db.log_evento(f"{id_ws} se ha desconectado de CENTRAL.")
-                if info_riego:
-                    responder_operario(info_riego["id_operador"], {
-                        "request_id": info_riego["request_id"], "id_ws": id_ws,
-                        "evento": "INTERRUMPIDO", "motivo": "La estacion se ha desconectado.",
-                    })
-                    with lock_riegos:
-                        riegos_activos.pop(id_ws, None)
+                # El Engine se desconecto del Monitor: DESCONECTADA y, si habia riego,
+                # se avisa al operario.
+                tratar_desconexion(id_ws, "El Engine ha cortado la conexion.")
  
             elif evento == "CONECTADO":
                 # El Monitor volvio: la estacion pasa a DISPONIBLE.
@@ -374,6 +402,12 @@ def accion_iniciar_riego(id_ws: str, duracion_seg: int = 60):
  
 def accion_bloquear(id_ws: str):
     # Boton "Bloquear": pone la estacion FUERA_DE_SERVICIO y cancela cualquier riego activo.
+    estacion = db.get_estacion(id_ws)
+    if not estacion:
+        return False, "La estacion no existe."
+    if estacion["estado"] == "DESCONECTADA":
+        # No se puede dar una orden a una estacion que no esta conectada ni inventar su estado.
+        return False, "La estacion esta desconectada: no se puede bloquear."
     enviar_comando(id_ws, "BLOQUEAR")
     db.set_estado(id_ws, "FUERA_DE_SERVICIO")
     with lock_riegos:
@@ -384,6 +418,11 @@ def accion_bloquear(id_ws: str):
  
 def accion_activar(id_ws: str):
     # Boton "Activar": deshace el bloqueo y deja la estacion DISPONIBLE.
+    estacion = db.get_estacion(id_ws)
+    if not estacion:
+        return False, "La estacion no existe."
+    if estacion["estado"] == "DESCONECTADA":
+        return False, "La estacion esta desconectada: no se puede activar."
     enviar_comando(id_ws, "ACTIVAR")
     db.set_estado(id_ws, "DISPONIBLE")
     db.log_evento(f"{id_ws} ACTIVADA de nuevo por CENTRAL.")
@@ -396,10 +435,11 @@ def main():
  
     # Cada parametro se toma, por orden de prioridad, de: argumento de linea de
     # comandos -> variable de entorno -> valor por defecto. En Railway se usan las
-    # variables de entorno (SOCKET_PORT, KAFKA_BROKER, WEB_PORT, DB_PATH).
+    # variables de entorno (SOCKET_PORT, KAFKA_BROKER, DB_PATH y PORT para la web:
+    # Railway asigna PORT y el dashboard debe escuchar en 0.0.0.0:$PORT).
     puerto_sockets = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.getenv("SOCKET_PORT", 5000))
     kafka_broker = sys.argv[2] if len(sys.argv) > 2 else os.getenv("KAFKA_BROKER", "localhost:9093")
-    puerto_web = int(sys.argv[3]) if len(sys.argv) > 3 else int(os.getenv("WEB_PORT", 8080))
+    puerto_web = int(sys.argv[3]) if len(sys.argv) > 3 else int(os.getenv("PORT") or os.getenv("WEB_PORT") or 8080)
     ruta_bd = os.getenv("DB_PATH", os.path.join(dir_cursor, "wm_central.db"))
  
     # Banner de arranque: es lo primero que ves en los logs de Railway.
@@ -414,6 +454,9 @@ def main():
     # 1) Base de datos y productor Kafka (si Kafka no responde, aqui salen los
     #    "Broker no disponible aun" y, agotados los reintentos, el programa termina).
     db = Database(ruta_bd)
+    # Punto 1 del enunciado: al (re)iniciar, las estaciones guardadas en la BD se
+    # muestran DESCONECTADAS hasta que cada una conecte de nuevo.
+    db.marcar_todas_desconectadas()
     productor = crear_productor(kafka_broker)
  
     # 2) Arrancamos los hilos de fondo. daemon=True: se cierran solos al terminar el programa.

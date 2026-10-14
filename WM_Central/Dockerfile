@@ -14,12 +14,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # (el contexto de build es la raiz del repo, por eso hay acceso a utils/ y a WM_Central/).
 COPY . .
  
-# .env esta en .gitignore y no llega a GitHub; el codigo solo lo usa
-# como marcador para localizar la raiz del proyecto, asi que basta uno vacio.
-RUN touch .env
  
 # EXPOSE es documentacion: indica que la app usa estos puertos.
-# 5000 = sockets de los Monitores; 8080 = dashboard web.
+# 5000 = sockets de los Monitores; 8080 = dashboard web (en Railway el dashboard
+# escucha en la variable PORT que asigna la plataforma).
 EXPOSE 5000
 EXPOSE 8080
  

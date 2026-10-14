@@ -63,10 +63,14 @@ from utils.kafka_utils import crear_productor, TOPIC_ESTADO_WS
 # Cada cuantos segundos se pregunta al Engine, y cuanto se espera su respuesta.
 HEARTBEAT_INTERVALO = 1.0
 HEARTBEAT_TIMEOUT = 3.0
+# Cada cuantos segundos el Monitor manda un latido (ENQ) a CENTRAL por la conexion
+# que mantiene abierta. CENTRAL da por desconectada la estacion si deja de recibirlos.
+LATIDO_CENTRAL = 5.0
 
 
-def registrar_en_central(ip_central, puerto_central, id_ws, ubicacion) -> bool:
-    """Se conecta a WM_Central y envia la trama de registro por sockets. Reintenta hasta lograrlo."""
+def registrar_en_central(ip_central, puerto_central, id_ws, ubicacion):
+    """Se conecta a WM_Central y envia la trama de registro por sockets. Reintenta hasta
+    lograrlo y devuelve el socket, que se deja ABIERTO para los latidos."""
     # Bucle de reintentos: si CENTRAL no esta accesible, se vuelve a intentar cada 5 s.
     while True:
         try:
@@ -95,24 +99,64 @@ def registrar_en_central(ip_central, puerto_central, id_ws, ubicacion) -> bool:
             valido, msg = desempaquetar_trama(trama_respuesta)
             if valido:
                 print(f"[MONITOR {id_ws}] Respuesta de CENTRAL: {msg}")
-            # El registro es una conversacion corta: se cierra la conexion y se sale del bucle.
-            cliente.close()
-            return True
+            # La conexion NO se cierra: queda abierta y mantener_enlace_central() manda
+            # latidos por ella. Si el Monitor muere, CENTRAL ve el cierre y marca la WS
+            # como DESCONECTADA.
+            return cliente
 
         except Exception as e:
             print(f"[MONITOR {id_ws}] No se pudo registrar en CENTRAL ({e}). Reintentando en 5s...")
             time.sleep(5)
 
 
+def sincronizar_estado_con_central(productor, id_ws):
+    """Tras (re)registrarse, CENTRAL no sabe el estado real de la estacion (el registro
+    la deja DESCONECTADA). Si el Engine esta conectado, se lo contamos: CONECTADO y, si
+    hay una fuga en curso, FUGA. Si el Engine no esta, la estacion debe seguir DESCONECTADA."""
+    with lock_estado:
+        conectado, fuga = engine_conectado, estado_fuga
+    if not conectado:
+        return
+    productor.send(TOPIC_ESTADO_WS, key=id_ws,
+                   value={"id_ws": id_ws, "evento": "CONECTADO", "timestamp": time.time()})
+    if fuga:
+        productor.send(TOPIC_ESTADO_WS, key=id_ws,
+                       value={"id_ws": id_ws, "evento": "FUGA", "timestamp": time.time()})
+    productor.flush()
+    print(f"[MONITOR {id_ws}] Estado sincronizado con CENTRAL tras re-registrarse.")
+
+
+def mantener_enlace_central(cliente, ip_central, puerto_central, id_ws, ubicacion, productor):
+    """Hilo: manda un ENQ cada LATIDO_CENTRAL s y espera ACK. Si CENTRAL no responde
+    (se cayo o se reinicio), vuelve a registrar la estacion."""
+    while True:
+        time.sleep(LATIDO_CENTRAL)
+        try:
+            cliente.sendall(ENQ)
+            if recv_exact_frame(cliente, timeout=10) != ACK:
+                raise ConnectionError("CENTRAL no respondio ACK al latido.")
+        except Exception as e:
+            print(f"[MONITOR {id_ws}] Enlace con CENTRAL perdido ({e}). Re-registrando...")
+            try:
+                cliente.close()
+            except Exception:
+                pass
+            cliente = registrar_en_central(ip_central, puerto_central, id_ws, ubicacion)
+            sincronizar_estado_con_central(productor, id_ws)
+
+
 # --------------------------------------------------------- enlace con Engine
 # Indica si ahora mismo hay una fuga notificada. Sirve para avisar a CENTRAL solo
 # al CAMBIAR de estado (no en cada latido), y esta protegido con un lock.
 estado_fuga = False
+# Indica si hay un Engine conectado ahora mismo (para poder contarle a CENTRAL el
+# estado real cuando la estacion se vuelve a registrar).
+engine_conectado = False
 lock_estado = threading.Lock()
 
 
 def atender_engine(conn, addr, id_ws, ubicacion, productor):
-    global estado_fuga
+    global estado_fuga, engine_conectado
     print(f"[MONITOR {id_ws}] Engine conectado desde {addr}")
 
     # Handshake: informamos al Engine de su identidad
@@ -121,6 +165,7 @@ def atender_engine(conn, addr, id_ws, ubicacion, productor):
     # Al conectar un Engine nuevo se parte de "sin fuga".
     with lock_estado:
         estado_fuga = False
+        engine_conectado = True
 
     try:
         while True:
@@ -173,6 +218,8 @@ def atender_engine(conn, addr, id_ws, ubicacion, productor):
         # Salgamos por donde salgamos: cerramos el socket y avisamos a CENTRAL de que
         # la estacion queda DESCONECTADA.
         conn.close()
+        with lock_estado:
+            engine_conectado = False
         productor.send(TOPIC_ESTADO_WS, key=id_ws,
                         value={"id_ws": id_ws, "evento": "DESCONECTADO", "timestamp": time.time()})
         productor.flush()
@@ -208,7 +255,12 @@ if __name__ == "__main__":
 
     # Orden de arranque: 1) registrar en CENTRAL (sockets), 2) crear productor Kafka,
     # 3) quedarse esperando al Engine (esta funcion no termina nunca).
-    registrar_en_central(ip_central, puerto_central, id_ws, ubicacion)
+    enlace = registrar_en_central(ip_central, puerto_central, id_ws, ubicacion)
     productor = crear_productor(kafka_broker)
+    threading.Thread(
+        target=mantener_enlace_central,
+        args=(enlace, ip_central, puerto_central, id_ws, ubicacion, productor),
+        daemon=True,
+    ).start()
 
     servidor_para_engine(puerto_engine, id_ws, ubicacion, productor)

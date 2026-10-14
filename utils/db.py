@@ -77,15 +77,17 @@ class Database:
     def upsert_estacion_registro(self, id_ws: str, ubicacion: str):
         """Alta o actualizacion de una estacion cuando su Monitor se registra/conecta."""
         # "Upsert" = INSERT + UPDATE: si la estacion no existe se inserta; si ya existe
-        # (ON CONFLICT sobre la clave primaria id_ws) se actualiza y pasa a DISPONIBLE.
+        # (ON CONFLICT sobre la clave primaria id_ws) se actualiza. Queda DESCONECTADA
+        # hasta que el Monitor informe de que su Engine esta conectado (evento
+        # CONECTADO): solo entonces se sabe que la estacion puede regar de verdad.
         # Los "?" son parametros: evitan inyeccion SQL (nunca concatenar texto en el SQL).
         with _lock:
             self._conn.execute(
                 """INSERT INTO estaciones (id_ws, ubicacion, estado, ultima_actualizacion)
-                   VALUES (?, ?, 'DISPONIBLE', ?)
+                   VALUES (?, ?, 'DESCONECTADA', ?)
                    ON CONFLICT(id_ws) DO UPDATE SET
                        ubicacion=excluded.ubicacion,
-                       estado='DISPONIBLE',
+                       estado='DESCONECTADA', caudal=0, volumen=0, operario=NULL,
                        ultima_actualizacion=excluded.ultima_actualizacion""",
                 (id_ws, ubicacion, time.time()),
             )
@@ -104,20 +106,28 @@ class Database:
     def set_telemetria(self, id_ws: str, caudal: float, volumen: float):
         # Cada mensaje de telemetria del Engine actualiza caudal y volumen, y deja
         # la estacion en REGANDO (si esta llegando telemetria es que esta regando).
+        # OJO: solo si estaba DISPONIBLE o ya REGANDO. Un mensaje rezagado no debe
+        # "resucitar" una estacion que CENTRAL acaba de bloquear (FUERA_DE_SERVICIO),
+        # que esta en FUGA o que esta DESCONECTADA.
         with _lock:
             self._conn.execute(
                 """UPDATE estaciones SET estado='REGANDO', caudal=?, volumen=?,
-                   ultima_actualizacion=? WHERE id_ws=?""",
+                   ultima_actualizacion=?
+                   WHERE id_ws=? AND estado IN ('DISPONIBLE', 'REGANDO')""",
                 (caudal, volumen, time.time(), id_ws),
             )
             self._conn.commit()
  
     def finalizar_riego(self, id_ws: str):
-        # Fin de un riego: vuelve a DISPONIBLE, caudal a 0 y se quita el operario.
+        # Fin de un riego: caudal a 0 y se quita el operario. La estacion vuelve a
+        # DISPONIBLE solo si seguia REGANDO: si mientras tanto CENTRAL la bloqueo
+        # (FUERA_DE_SERVICIO), hubo una FUGA o se desconecto, ese estado se respeta.
         with _lock:
             self._conn.execute(
-                """UPDATE estaciones SET estado='DISPONIBLE', caudal=0, operario=NULL,
-                   ultima_actualizacion=? WHERE id_ws=?""",
+                """UPDATE estaciones SET
+                       estado=CASE WHEN estado='REGANDO' THEN 'DISPONIBLE' ELSE estado END,
+                       caudal=0, volumen=0, operario=NULL,
+                       ultima_actualizacion=? WHERE id_ws=?""",
                 (time.time(), id_ws),
             )
             self._conn.commit()
@@ -126,6 +136,19 @@ class Database:
         # Atajo: reutiliza set_estado con el estado DESCONECTADA.
         self.set_estado(id_ws, 'DESCONECTADA')
  
+    def marcar_todas_desconectadas(self):
+        # Arranque de CENTRAL: hasta que una WS no se (re)registre no se conoce su
+        # estado real, asi que se BORRA todo lo que se sabia de ella (estado, caudal,
+        # volumen y operario) y queda DESCONECTADA. Las estaciones (id y ubicacion)
+        # se conservan: lo que se descarta es el estado, no el alta.
+        with _lock:
+            self._conn.execute(
+                """UPDATE estaciones SET estado='DESCONECTADA', caudal=0, volumen=0,
+                   operario=NULL, ultima_actualizacion=?""",
+                (time.time(),),
+            )
+            self._conn.commit()
+
     def get_estacion(self, id_ws: str):
         # Devuelve UNA estacion como diccionario, o None si no existe.
         with _lock:

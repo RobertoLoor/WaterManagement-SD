@@ -8,8 +8,6 @@
 # Uso:
 #   docker compose -f docker-compose.lab.yml --env-file .env.lab up -d ws01_monitor ws01_engine ws02_monitor ws02_engine
 #   docker compose -f docker-compose.lab.yml --env-file .env.lab run --rm fo1   (necesita -it para el menu)
-version: '3.8'
-
 services:
 
   # ---- Estacion WS-01: Monitor ----

@@ -140,10 +140,12 @@ async function accion(id_ws, accion){
     duracion_seg = parseInt(prompt('Duración del riego (segundos):', '60') || '60', 10);
   }
   // POST /api/action con el cuerpo en JSON (lo recibe api_action() en dashboard.py).
-  await fetch('/api/action', {
+  const resp = await fetch('/api/action', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({accion, id_ws, duracion_seg})
   });
+  // Si CENTRAL no pudo hacer la accion (p. ej. estacion desconectada), se le dice al usuario.
+  try { const r = await resp.json(); if(!r.ok) alert(r.mensaje); } catch(e) {}
   // Actualizamos ya, sin esperar al siguiente ciclo de 1 s.
   refrescar();
 }

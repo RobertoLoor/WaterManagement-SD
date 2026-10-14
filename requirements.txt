@@ -6,9 +6,5 @@
 # ficheros y aparece el error "cannot import name 'classproperty'".
 kafka-python-ng
 
-# Carga variables desde ficheros .env. Nota: en el codigo actual NO se usa
-# (los .env solo se leen con "--env-file" de docker compose), asi que podria quitarse.
-python-dotenv
-
 # Framework web ligero: sirve el dashboard de WM_Central.
 Flask
