@@ -73,11 +73,19 @@ def hilo_broadcast(kafka_broker):
     # llegan mensajes nuevos. Nos basta: el broadcast se repite cada 2 s.
     consumidor = crear_consumidor(TOPIC_BROADCAST, kafka_broker, group_id=None)
     while True:
-        for msg in consumidor:
-            # Cada mensaje trae la lista completa de estaciones; la guardamos por id.
-            with lock_estaciones:
-                for e in msg.value.get("estaciones", []):
-                    estaciones_conocidas[e["id_ws"]] = e
+        try:
+            for msg in consumidor:
+                try:
+                    # Cada mensaje trae la lista completa de estaciones; la guardamos por id.
+                    with lock_estaciones:
+                        for e in msg.value.get("estaciones", []):
+                            if "id_ws" in e:
+                                estaciones_conocidas[e["id_ws"]] = e
+                except Exception as e_inner:
+                    print(f"[FO][ERROR] Procesando broadcast: {e_inner}")
+        except Exception as e:
+            print(f"[FO][ERROR] hilo_broadcast: {e}. Reintentando...")
+            time.sleep(1)
         time.sleep(0.2)
 
 
@@ -85,39 +93,50 @@ def hilo_respuestas(kafka_broker, id_operador):
     """Escucha las respuestas de CENTRAL dirigidas a este operario."""
     # group_id UNICO por ejecucion (uuid): asi cada WM_FO recibe TODAS las respuestas.
     # Si varios FO compartieran group_id, Kafka repartiria los mensajes entre ellos.
-    consumidor = crear_consumidor(TOPIC_RESPUESTAS, kafka_broker, group_id=f"fo-{id_operador}-{uuid.uuid4()}")
+    # desde_inicio=True: si el operario arranca cuando el riego ya finalizó,
+    # leerá desde el principio del topic y filtrará por id_operador. Así recibe
+    # los mensajes que le corresponden aunque llegue tarde (ej: si el riego
+    # tiene 5 mensajes y llega al 3, recibe 3, 4 y 5; si llega al 5 solo ve el resumen).
+    consumidor = crear_consumidor(TOPIC_RESPUESTAS, kafka_broker, group_id=f"fo-{id_operador}-{uuid.uuid4()}", desde_inicio=True)
     while True:
-        for msg in consumidor:
-            data = msg.value
-            # El topic es compartido por todos los operarios: ignoramos lo que no es nuestro.
-            if data.get("id_operador") != id_operador:
-                continue
+        try:
+            for msg in consumidor:
+                try:
+                    data = msg.value
+                    # El topic es compartido por todos los operarios: ignoramos lo que no es nuestro.
+                    if data.get("id_operador") != id_operador:
+                        continue
 
-            evento = data.get("evento")
-            id_ws = data.get("id_ws")
+                    evento = data.get("evento")
+                    id_ws = data.get("id_ws", "?")
 
-            # Mostramos por pantalla lo que dice CENTRAL segun el tipo de evento.
-            if evento == "AUTORIZADO":
-                print(f"\n[CENTRAL] Riego AUTORIZADO en {id_ws}. {data.get('motivo', '')}")
-            elif evento == "DENEGADO":
-                print(f"\n[CENTRAL] Riego DENEGADO en {id_ws}. Motivo: {data.get('motivo', '')}")
-            elif evento == "INTERRUMPIDO":
-                print(f"\n[CENTRAL] Riego INTERRUMPIDO en {id_ws}. Motivo: {data.get('motivo', '')}")
-            elif evento == "RESUMEN":
-                print(f"\n[CENTRAL] Riego finalizado en {id_ws} ({data.get('motivo')}). "
-                      f"Volumen total: {data.get('volumen_total_l', 0)} L, "
-                      f"duracion: {data.get('duracion_seg', 0)} s.")
+                    # Mostramos por pantalla lo que dice CENTRAL segun el tipo de evento.
+                    if evento == "AUTORIZADO":
+                        print(f"\n[CENTRAL] Riego AUTORIZADO en {id_ws}. {data.get('motivo', '')}")
+                    elif evento == "DENEGADO":
+                        print(f"\n[CENTRAL] Riego DENEGADO en {id_ws}. Motivo: {data.get('motivo', '')}")
+                    elif evento == "INTERRUMPIDO":
+                        print(f"\n[CENTRAL] Riego INTERRUMPIDO en {id_ws}. Motivo: {data.get('motivo', '')}")
+                    elif evento == "RESUMEN":
+                        print(f"\n[CENTRAL] Riego finalizado en {id_ws} ({data.get('motivo')}). "
+                              f"Volumen total: {data.get('volumen_total_l', 0)} L, "
+                              f"duracion: {data.get('duracion_seg', 0)} s.")
 
-            # Si alguien esta esperando esta respuesta (modo fichero), lo despertamos.
-            request_id = data.get("request_id")
-            with lock_resultados:
-                pendiente = resultados_pendientes.get(request_id)
-            if pendiente and evento in ("AUTORIZADO", "DENEGADO", "RESUMEN", "INTERRUMPIDO"):
-                # Solo las respuestas "terminales" liberan la espera del modo fichero
-                # (AUTORIZADO no: hay que esperar a que el riego acabe con RESUMEN).
-                if evento in ("DENEGADO", "RESUMEN", "INTERRUMPIDO"):
-                    pendiente["resultado"] = data
-                    pendiente["event"].set()
+                    # Si alguien esta esperando esta respuesta (modo fichero), lo despertamos.
+                    request_id = data.get("request_id")
+                    with lock_resultados:
+                        pendiente = resultados_pendientes.get(request_id)
+                    if pendiente and evento in ("AUTORIZADO", "DENEGADO", "RESUMEN", "INTERRUMPIDO"):
+                        # Solo las respuestas "terminales" liberan la espera del modo fichero
+                        # (AUTORIZADO no: hay que esperar a que el riego acabe con RESUMEN).
+                        if evento in ("DENEGADO", "RESUMEN", "INTERRUMPIDO"):
+                            pendiente["resultado"] = data
+                            pendiente["event"].set()
+                except Exception as e:
+                    print(f"[FO {id_operador}][ERROR] Procesando respuesta: {e}")
+        except Exception as e:
+            print(f"[FO {id_operador}][ERROR] hilo_respuestas: {e}. Reintentando...")
+            time.sleep(1)
         time.sleep(0.2)
 
 
@@ -153,8 +172,8 @@ def mostrar_estaciones():
             return
         # Cabecera con anchos fijos (<10 = alineado a la izquierda en 10 caracteres).
         print(f"\n{'ID':<10}{'UBICACION':<25}{'ESTADO':<20}{'CAUDAL':<10}{'VOLUMEN':<10}{'OPERARIO':<10}")
-        for e in sorted(estaciones_conocidas.values(), key=lambda x: x["id_ws"]):
-            print(f"{e['id_ws']:<10}{(e.get('ubicacion') or '-'):<25}{e['estado']:<20}"
+        for e in sorted(estaciones_conocidas.values(), key=lambda x: x.get("id_ws", "")):
+            print(f"{e.get('id_ws', '?'):<10}{(e.get('ubicacion') or '-'):<25}{e.get('estado', '?'):<20}"
                   f"{e.get('caudal', 0) or 0:<10}{e.get('volumen', 0) or 0:<10}{(e.get('operario') or '-'):<10}")
     print()
 
@@ -222,6 +241,10 @@ if __name__ == "__main__":
     kafka_broker = sys.argv[1] if len(sys.argv) > 1 else os.getenv("KAFKA_BROKER", "localhost:9093")
     id_operador = sys.argv[2] if len(sys.argv) > 2 else os.getenv("OPERADOR_ID", "FO-01")
     ruta_fichero = sys.argv[3] if len(sys.argv) > 3 else os.getenv("ACTIVACIONES_FILE")
+    # AUTO_MODE: si se pasa el fichero como tercer argumento (argv[3]) o la variable
+    # de entorno AUTO_MODE=1, el operario ejecuta el fichero directamente sin mostrar
+    # el menu interactivo. Util para lanzar varios operarios en paralelo desde un script.
+    modo_auto = (len(sys.argv) > 3) or (os.getenv("AUTO_MODE", "0") == "1")
 
     print(f"[FO {id_operador}] Conectando a Kafka ({kafka_broker})...")
     productor = crear_productor(kafka_broker)
@@ -231,4 +254,15 @@ if __name__ == "__main__":
     threading.Thread(target=hilo_respuestas, args=(kafka_broker, id_operador), daemon=True).start()
 
     time.sleep(1)  # pequeno margen para que los consumidores arranquen
-    menu(productor, id_operador, ruta_fichero)
+
+    if modo_auto and ruta_fichero:
+        # Modo automatico: ejecuta el fichero de activaciones sin interaccion del usuario
+        # y termina al acabar. Activado con AUTO_MODE=1 o pasando el fichero como argv[3].
+        try:
+            ejecutar_fichero(productor, id_operador, ruta_fichero)
+        except FileNotFoundError:
+            print(f"[FO {id_operador}] Fichero no encontrado: '{ruta_fichero}'.")
+        print(f"[FO {id_operador}] Modo automatico completado. Saliendo.")
+        os._exit(0)
+    else:
+        menu(productor, id_operador, ruta_fichero)

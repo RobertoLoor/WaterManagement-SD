@@ -32,15 +32,18 @@ import random
 # ---------------------------------------------------------------------------
 # VISION GENERAL PARA ESTUDIAR
 # ---------------------------------------------------------------------------
-# El Engine es la "maquina" de la estacion (simula la electrovalvula). Tiene 3 hilos
+# El Engine es la "maquina" de la estacion (simula la electrovalvula). Tiene 4 hilos
 # fijos y crea uno mas cada vez que hay que regar:
 #
-#   hilo_monitor   : cliente TCP del Monitor. Recibe IDENTIDAD y contesta OK/KO a cada PING.
-#   hilo_comandos  : consumidor Kafka de 'comandos-estacion' (INICIAR_RIEGO, DETENER_RIEGO,
-#                    BLOQUEAR, ACTIVAR...). Ignora los comandos dirigidos a otra estacion.
-#   hilo_teclado   : lee la consola: 'k' = simular fuga, 'o' = resolverla, 'q' = salir.
-#   hilo_riego     : (uno por riego) manda telemetria cada 1 s a 'telemetria-riego' y termina
-#                    con un mensaje RIEGO_FINALIZADO indicando el motivo.
+#   hilo_monitor    : cliente TCP del Monitor. Recibe IDENTIDAD y contesta OK/KO a cada PING.
+#   hilo_comandos   : consumidor Kafka de 'comandos-estacion' (INICIAR_RIEGO, DETENER_RIEGO,
+#                     BLOQUEAR, ACTIVAR...). Ignora los comandos dirigidos a otra estacion.
+#   hilo_teclado    : lee la consola: 'k' = simular fuga, 'o' = resolverla, 'q' = salir.
+#   hilo_auto_riego : (opcional) si AUTO_RIEGO_INTERVALO > 0, inicia riegos automaticos
+#                     cada N segundos sin necesitar operario ni CENTRAL. La estacion se
+#                     riega sola. Se puede desactivar con AUTO_RIEGO_INTERVALO=0.
+#   hilo_riego      : (uno por riego) manda telemetria cada 1 s a 'telemetria-riego' y termina
+#                     con un mensaje RIEGO_FINALIZADO indicando el motivo.
 #
 # Motivos de fin de riego: TIEMPO_AGOTADO, FUGA, BLOQUEO, MANUAL.
 # Sincronizacion: Event (banderas entre hilos) y Lock (proteger variables compartidas).
@@ -202,6 +205,38 @@ def hilo_riego(productor, duracion_seg: int, operario: str):
     operario_actual = None
 
 
+def hilo_auto_riego(productor, intervalo: int, duracion: int, identidad_lista: threading.Event):
+    """Inicia riegos automaticos cada 'intervalo' segundos si la estacion esta libre.
+    La estacion se riega sola sin necesitar operario ni orden de CENTRAL.
+    Activado cuando AUTO_RIEGO_INTERVALO > 0 (variable de entorno o argumento).
+    El operario que aparece en la telemetria es 'ESTACION' (auto-gestionado).
+    """
+    identidad_lista.wait()   # esperar a conocer id_ws antes de actuar
+    print(f"[ENGINE {id_ws}] Auto-riego activado: cada {intervalo}s durante {duracion}s.")
+    while True:
+        time.sleep(intervalo)
+        # Comprobar condiciones antes de lanzar: sin fuga, sin bloqueo, sin riego activo.
+        with lock_estado:
+            fuga_actual = en_fuga
+            bloqueada   = fuera_de_servicio
+        if fuga_actual:
+            print(f"[ENGINE {id_ws}] Auto-riego pospuesto: hay una fuga activa.")
+            continue
+        if bloqueada:
+            print(f"[ENGINE {id_ws}] Auto-riego pospuesto: estacion fuera de servicio.")
+            continue
+        if riego_activo.is_set():
+            print(f"[ENGINE {id_ws}] Auto-riego pospuesto: ya hay un riego en curso.")
+            continue
+        # Todo correcto: lanzar el riego autonomo en su propio hilo.
+        print(f"[ENGINE {id_ws}] >>> Auto-riego iniciado ({duracion}s). Operario: ESTACION.")
+        threading.Thread(
+            target=hilo_riego,
+            args=(productor, duracion, "ESTACION"),   # "ESTACION" = auto-gestionado, sin FO
+            daemon=True,
+        ).start()
+
+
 def hilo_comandos(kafka_broker, identidad_lista: threading.Event):
     """Escucha los comandos que envia CENTRAL (iniciar/detener riego, bloquear, activar...)."""
     global fuera_de_servicio
@@ -213,68 +248,110 @@ def hilo_comandos(kafka_broker, identidad_lista: threading.Event):
     print(f"[ENGINE {id_ws}] Escuchando comandos en '{TOPIC_COMANDOS}'...")
 
     while True:
-        for msg in consumidor:
-            data = msg.value
-            destino = data.get("id_ws")
-            # El topic lo comparten todas las estaciones: nos quedamos solo con lo nuestro
-            # (o con lo dirigido a "ALL", es decir, a todas).
-            if destino not in (id_ws, "ALL"):
-                continue
+        try:
+            for msg in consumidor:
+                try:
+                    data = msg.value
+                    destino = data.get("id_ws")
+                    # El topic lo comparten todas las estaciones: nos quedamos solo con lo nuestro
+                    # (o con lo dirigido a "ALL", es decir, a todas).
+                    if destino not in (id_ws, "ALL"):
+                        continue
 
-            comando = data.get("comando")
+                    comando = data.get("comando")
 
-            if comando == "INICIAR_RIEGO":
-                with lock_estado:
-                    bloqueada = fuera_de_servicio
-                # No se inicia un segundo riego a la vez ni si esta bloqueada.
-                if riego_activo.is_set() or bloqueada:
-                    print(f"[ENGINE {id_ws}] Orden INICIAR_RIEGO ignorada (ya regando o fuera de servicio).")
-                    continue
-                # El riego dura segundos: va en su propio hilo para no bloquear la lectura de comandos.
-                threading.Thread(
-                    target=hilo_riego,
-                    args=(productor, data.get("duracion_seg", 60), data.get("operario")),
-                    daemon=True,
-                ).start()
+                    if comando == "INICIAR_RIEGO":
+                        with lock_estado:
+                            bloqueada = fuera_de_servicio
+                        # No se inicia un segundo riego a la vez ni si esta bloqueada.
+                        if riego_activo.is_set() or bloqueada:
+                            print(f"[ENGINE {id_ws}] Orden INICIAR_RIEGO ignorada (ya regando o fuera de servicio).")
+                            continue
+                        # Validar duracion.
+                        try:
+                            duracion = int(data.get("duracion_seg", 60))
+                            if duracion <= 0:
+                                raise ValueError
+                        except (TypeError, ValueError):
+                            print(f"[ENGINE {id_ws}][WARN] duracion_seg invalida, usando 60s.")
+                            duracion = 60
+                        # El riego dura segundos: va en su propio hilo para no bloquear la lectura de comandos.
+                        threading.Thread(
+                            target=hilo_riego,
+                            args=(productor, duracion, data.get("operario")),
+                            daemon=True,
+                        ).start()
 
-            elif comando == "DETENER_RIEGO":
-                # No para el hilo a la fuerza: levanta una bandera que hilo_riego comprueba cada ciclo.
-                if riego_activo.is_set():
-                    riego_stop_solicitado.set()
+                    elif comando == "DETENER_RIEGO":
+                        # No para el hilo a la fuerza: levanta una bandera que hilo_riego comprueba cada ciclo.
+                        if riego_activo.is_set():
+                            riego_stop_solicitado.set()
 
-            elif comando == "RESET_CONTADOR":
-                global volumen_acumulado
-                volumen_acumulado = 0.0
-                print(f"[ENGINE {id_ws}] Contador reiniciado.")
+                    elif comando == "RESET_CONTADOR":
+                        global volumen_acumulado
+                        volumen_acumulado = 0.0
+                        print(f"[ENGINE {id_ws}] Contador reiniciado.")
 
-            elif comando == "BLOQUEAR":
-                # Pone la estacion fuera de servicio y corta el riego si lo hubiera.
-                with lock_estado:
-                    fuera_de_servicio = True
-                if riego_activo.is_set():
-                    riego_stop_solicitado.set()
-                print(f"[ENGINE {id_ws}] >>> FUERA DE SERVICIO por orden de CENTRAL.")
+                    elif comando == "BLOQUEAR":
+                        # Pone la estacion fuera de servicio y corta el riego si lo hubiera.
+                        with lock_estado:
+                            fuera_de_servicio = True
+                        if riego_activo.is_set():
+                            riego_stop_solicitado.set()
+                        print(f"[ENGINE {id_ws}] >>> FUERA DE SERVICIO por orden de CENTRAL.")
 
-            elif comando == "ACTIVAR":
-                # Levanta el bloqueo: vuelve a poder regar.
-                with lock_estado:
-                    fuera_de_servicio = False
-                print(f"[ENGINE {id_ws}] >>> ACTIVADA de nuevo por orden de CENTRAL.")
+                    elif comando == "ACTIVAR":
+                        # Levanta el bloqueo: vuelve a poder regar.
+                        with lock_estado:
+                            fuera_de_servicio = False
+                        print(f"[ENGINE {id_ws}] >>> ACTIVADA de nuevo por orden de CENTRAL.")
+
+                    elif comando is not None:
+                        print(f"[ENGINE {id_ws}][WARN] Comando desconocido: {comando!r}")
+
+                except Exception as e:
+                    print(f"[ENGINE {id_ws}][ERROR] hilo_comandos procesando mensaje: {e}")
+        except Exception as e:
+            print(f"[ENGINE {id_ws if id_ws else '?'}][ERROR] hilo_comandos loop: {e}. Reintentando...")
+            time.sleep(1)
         time.sleep(0.2)
 
 
 if __name__ == "__main__":
     # Parametros: argumento de linea de comandos -> variable de entorno -> valor por defecto.
-    ip_monitor = sys.argv[1] if len(sys.argv) > 1 else os.getenv("MONITOR_HOST", "127.0.0.1")
+    ip_monitor     = sys.argv[1] if len(sys.argv) > 1 else os.getenv("MONITOR_HOST", "127.0.0.1")
     puerto_monitor = int(sys.argv[2]) if len(sys.argv) > 2 else int(os.getenv("MONITOR_PORT", 6001))
-    kafka_broker = sys.argv[3] if len(sys.argv) > 3 else os.getenv("KAFKA_BROKER", "localhost:9093")
+    kafka_broker   = sys.argv[3] if len(sys.argv) > 3 else os.getenv("KAFKA_BROKER", "localhost:9093")
 
-    # Event compartido: hilo_monitor lo activa al recibir la identidad; hilo_comandos espera a que se active.
+    # Auto-riego autonomo de la estacion (sin operario ni CENTRAL):
+    #   AUTO_RIEGO_INTERVALO: segundos entre riegos automaticos (0 = desactivado, defecto: 0).
+    #   AUTO_RIEGO_DURACION : duracion de cada auto-riego en segundos (defecto: 30).
+    auto_intervalo = int(os.getenv("AUTO_RIEGO_INTERVALO", "0"))
+    auto_duracion  = int(os.getenv("AUTO_RIEGO_DURACION",  "30"))
+
+    # Event compartido: hilo_monitor lo activa al recibir la identidad;
+    # hilo_comandos y hilo_auto_riego esperan a que se active.
     identidad_lista = threading.Event()
 
-    threading.Thread(target=hilo_monitor, args=(ip_monitor, puerto_monitor, identidad_lista), daemon=True).start()
-    threading.Thread(target=hilo_comandos, args=(kafka_broker, identidad_lista), daemon=True).start()
-    threading.Thread(target=hilo_teclado, daemon=True).start()
+    # Productor Kafka compartido entre hilo_auto_riego y hilo_riego.
+    # hilo_comandos crea el suyo propio (necesita el id_ws para el group_id).
+    productor_auto = None
+    if auto_intervalo > 0:
+        productor_auto = crear_productor(kafka_broker)
+
+    threading.Thread(target=hilo_monitor,   args=(ip_monitor, puerto_monitor, identidad_lista), daemon=True).start()
+    threading.Thread(target=hilo_comandos,  args=(kafka_broker, identidad_lista), daemon=True).start()
+    threading.Thread(target=hilo_teclado,   daemon=True).start()
+
+    if auto_intervalo > 0:
+        threading.Thread(
+            target=hilo_auto_riego,
+            args=(productor_auto, auto_intervalo, auto_duracion, identidad_lista),
+            daemon=True,
+        ).start()
+        print(f"[ENGINE] Auto-riego configurado: cada {auto_intervalo}s durante {auto_duracion}s.")
+    else:
+        print("[ENGINE] Auto-riego desactivado (AUTO_RIEGO_INTERVALO=0).")
 
     print("[ENGINE] Iniciado. Esperando identidad del Monitor...")
     # El hilo principal solo mantiene vivo el programa (los demas son daemon).

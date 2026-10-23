@@ -1,0 +1,6 @@
+[
+  { "id_ws": "WS-05", "duracion_seg": 15 },
+  { "id_ws": "WS-10", "duracion_seg": 15 },
+  { "id_ws": "WS-15", "duracion_seg": 15 },
+  { "id_ws": "WS-20", "duracion_seg": 15 }
+]

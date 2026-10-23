@@ -219,100 +219,130 @@ def hilo_peticiones(broker: str):
     # while True + for: el consumidor tiene consumer_timeout_ms=1000, asi que el "for"
     # termina si pasa 1 s sin mensajes; el "while" lo vuelve a abrir (con un sleep corto).
     while True:
-        for msg in consumidor:
-            data = msg.value
-            # Solo nos interesan las solicitudes de riego; el resto se ignora.
-            if data.get("tipo") != "SOLICITUD_RIEGO":
-                continue
-            id_ws = data.get("id_ws")
-            id_operador = data.get("id_operador")
-            duracion = data.get("duracion_seg", 60)
-            # Si el operario no manda request_id, se genera uno unico (UUID).
-            request_id = data.get("request_id", str(uuid.uuid4()))
-            # Alta del operario en la BD la primera vez que aparece (tabla 'operarios').
-            if id_operador:
-                db.upsert_operario(id_operador)
- 
-            # Consultamos el estado actual de la estacion y si ya hay un riego en curso.
-            estacion = db.get_estacion(id_ws)
-            with lock_riegos:
-                ya_regando = id_ws in riegos_activos
- 
-            # CASO 1: la estacion no existe en la BD -> denegamos.
-            if not estacion:
-                responder_operario(id_operador, {
-                    "request_id": request_id, "id_ws": id_ws, "evento": "DENEGADO",
-                    "motivo": "La estacion no existe o nunca se ha conectado a CENTRAL.",
-                })
-                continue
- 
-            # CASO 2: existe pero no esta disponible (regando, fuga, bloqueada, desconectada).
-            if ya_regando or estacion["estado"] not in ESTADOS_QUE_PERMITEN_RIEGO:
-                # Mensaje de motivo segun el estado actual.
-                motivos = {
-                    "REGANDO": "La estacion ya esta regando en este momento.",
-                    "FUGA": "Fuga detectada: el riego esta bloqueado hasta resolver la averia.",
-                    "FUERA_DE_SERVICIO": "La estacion esta fuera de servicio por orden de CENTRAL.",
-                    "DESCONECTADA": "La estacion no esta conectada a CENTRAL.",
-                }
-                motivo = motivos.get(estacion["estado"], "La estacion no esta disponible.")
-                responder_operario(id_operador, {
-                    "request_id": request_id, "id_ws": id_ws, "evento": "DENEGADO", "motivo": motivo,
-                })
-                db.log_evento(f"Riego DENEGADO en {id_ws} solicitado por {id_operador}: {motivo}")
-                continue
- 
-            # CASO 3: todo correcto -> autorizar el riego.
-            # 3a) Apuntamos el riego como activo en memoria.
-            with lock_riegos:
-                riegos_activos[id_ws] = {
-                    "request_id": request_id, "id_operador": id_operador, "duracion_seg": duracion,
-                }
-            # 3b) Actualizamos la BD, mandamos la orden al Engine y avisamos al operario.
-            db.set_estado(id_ws, "REGANDO", operario=id_operador)
-            enviar_comando(id_ws, "INICIAR_RIEGO", duracion_seg=duracion, operario=id_operador)
-            responder_operario(id_operador, {
-                "request_id": request_id, "id_ws": id_ws, "evento": "AUTORIZADO",
-                "motivo": "Riego autorizado e iniciado.", "duracion_seg": duracion,
-            })
-            db.log_evento(f"Riego AUTORIZADO en {id_ws} por {id_operador} durante {duracion}s.")
+        try:
+            for msg in consumidor:
+                try:
+                    data = msg.value
+                    # Solo nos interesan las solicitudes de riego; el resto se ignora.
+                    if data.get("tipo") != "SOLICITUD_RIEGO":
+                        continue
+                    id_ws = data.get("id_ws")
+                    id_operador = data.get("id_operador")
+                    duracion = data.get("duracion_seg", 60)
+                    # Validacion de campos obligatorios.
+                    if not id_ws or not id_operador:
+                        print(f"[KAFKA][WARN] Mensaje SOLICITUD_RIEGO incompleto (falta id_ws o id_operador): {data}")
+                        continue
+                    # Duracion debe ser un entero positivo.
+                    try:
+                        duracion = int(duracion)
+                        if duracion <= 0:
+                            raise ValueError
+                    except (TypeError, ValueError):
+                        print(f"[KAFKA][WARN] duracion_seg invalida ({duracion!r}), usando 60s.")
+                        duracion = 60
+                    # Si el operario no manda request_id, se genera uno unico (UUID).
+                    request_id = data.get("request_id", str(uuid.uuid4()))
+                    # Alta del operario en la BD la primera vez que aparece (tabla 'operarios').
+                    db.upsert_operario(id_operador)
+
+                    # Consultamos el estado actual de la estacion y si ya hay un riego en curso.
+                    estacion = db.get_estacion(id_ws)
+                    with lock_riegos:
+                        ya_regando = id_ws in riegos_activos
+
+                    # CASO 1: la estacion no existe en la BD -> denegamos.
+                    if not estacion:
+                        responder_operario(id_operador, {
+                            "request_id": request_id, "id_ws": id_ws, "evento": "DENEGADO",
+                            "motivo": "La estacion no existe o nunca se ha conectado a CENTRAL.",
+                        })
+                        continue
+
+                    # CASO 2: existe pero no esta disponible (regando, fuga, bloqueada, desconectada).
+                    if ya_regando or estacion["estado"] not in ESTADOS_QUE_PERMITEN_RIEGO:
+                        # Mensaje de motivo segun el estado actual.
+                        motivos = {
+                            "REGANDO": "La estacion ya esta regando en este momento.",
+                            "FUGA": "Fuga detectada: el riego esta bloqueado hasta resolver la averia.",
+                            "FUERA_DE_SERVICIO": "La estacion esta fuera de servicio por orden de CENTRAL.",
+                            "DESCONECTADA": "La estacion no esta conectada a CENTRAL.",
+                        }
+                        motivo = motivos.get(estacion["estado"], "La estacion no esta disponible.")
+                        if ya_regando:
+                            motivo = motivos["REGANDO"]
+                        responder_operario(id_operador, {
+                            "request_id": request_id, "id_ws": id_ws, "evento": "DENEGADO", "motivo": motivo,
+                        })
+                        db.log_evento(f"Riego DENEGADO en {id_ws} solicitado por {id_operador}: {motivo}")
+                        continue
+
+                    # CASO 3: todo correcto -> autorizar el riego.
+                    # 3a) Apuntamos el riego como activo en memoria.
+                    with lock_riegos:
+                        riegos_activos[id_ws] = {
+                            "request_id": request_id, "id_operador": id_operador, "duracion_seg": duracion,
+                        }
+                    # 3b) Actualizamos la BD, mandamos la orden al Engine y avisamos al operario.
+                    db.set_estado(id_ws, "REGANDO", operario=id_operador)
+                    enviar_comando(id_ws, "INICIAR_RIEGO", duracion_seg=duracion, operario=id_operador)
+                    responder_operario(id_operador, {
+                        "request_id": request_id, "id_ws": id_ws, "evento": "AUTORIZADO",
+                        "motivo": "Riego autorizado e iniciado.", "duracion_seg": duracion,
+                    })
+                    db.log_evento(f"Riego AUTORIZADO en {id_ws} por {id_operador} durante {duracion}s.")
+                except Exception as e:
+                    print(f"[KAFKA][ERROR] hilo_peticiones procesando mensaje: {e}")
+        except Exception as e:
+            print(f"[KAFKA][ERROR] hilo_peticiones loop: {e}. Reintentando...")
+            time.sleep(1)
         time.sleep(0.2)
- 
- 
+
+
 def hilo_telemetria(broker: str):
     """Escucha la telemetria y los resumenes finales que envian los Engines (WM_WS_E)."""
     consumidor = crear_consumidor(TOPIC_TELEMETRIA, broker, group_id="central-telemetria")
     print(f"[KAFKA] Escuchando telemetria en '{TOPIC_TELEMETRIA}'...")
     while True:
-        for msg in consumidor:
-            data = msg.value
-            id_ws = data.get("id_ws")
-            # Si el mensaje no indica tipo se asume que es telemetria normal.
-            tipo = data.get("tipo", "TELEMETRIA")
- 
-            if tipo == "TELEMETRIA":
-                # Lectura periodica durante el riego: guardamos caudal y volumen acumulado.
-                db.set_telemetria(id_ws, data.get("caudal_lmin", 0), data.get("volumen_total_l", 0))
- 
-            elif tipo == "RIEGO_FINALIZADO":
-                # El riego termino (por tiempo, manual, fuga...): estacion vuelve a DISPONIBLE.
-                db.finalizar_riego(id_ws)
-                # Sacamos el riego de la lista de activos (pop devuelve lo que habia, o None).
-                with lock_riegos:
-                    info = riegos_activos.pop(id_ws, None)
-                motivo = data.get("motivo", "MANUAL")
-                db.log_evento(f"Riego finalizado en {id_ws} ({motivo}). "
-                               f"Volumen total: {data.get('volumen_total_l', 0)} L.")
-                # Si sabemos quien lo pidio, le mandamos un RESUMEN con el volumen y duracion.
-                if info:
-                    responder_operario(info["id_operador"], {
-                        "request_id": info["request_id"], "id_ws": id_ws, "evento": "RESUMEN",
-                        "motivo": motivo, "volumen_total_l": data.get("volumen_total_l", 0),
-                        "duracion_seg": data.get("duracion_seg", 0),
-                    })
+        try:
+            for msg in consumidor:
+                try:
+                    data = msg.value
+                    id_ws = data.get("id_ws")
+                    if not id_ws:
+                        print(f"[KAFKA][WARN] Mensaje de telemetria sin id_ws: {data}")
+                        continue
+                    # Si el mensaje no indica tipo se asume que es telemetria normal.
+                    tipo = data.get("tipo", "TELEMETRIA")
+
+                    if tipo == "TELEMETRIA":
+                        # Lectura periodica durante el riego: guardamos caudal y volumen acumulado.
+                        db.set_telemetria(id_ws, data.get("caudal_lmin", 0), data.get("volumen_total_l", 0))
+
+                    elif tipo == "RIEGO_FINALIZADO":
+                        # El riego termino (por tiempo, manual, fuga...): estacion vuelve a DISPONIBLE.
+                        db.finalizar_riego(id_ws)
+                        # Sacamos el riego de la lista de activos (pop devuelve lo que habia, o None).
+                        with lock_riegos:
+                            info = riegos_activos.pop(id_ws, None)
+                        motivo = data.get("motivo", "MANUAL")
+                        db.log_evento(f"Riego finalizado en {id_ws} ({motivo}). "
+                                       f"Volumen total: {data.get('volumen_total_l', 0)} L.")
+                        # Si sabemos quien lo pidio, le mandamos un RESUMEN con el volumen y duracion.
+                        if info:
+                            responder_operario(info["id_operador"], {
+                                "request_id": info["request_id"], "id_ws": id_ws, "evento": "RESUMEN",
+                                "motivo": motivo, "volumen_total_l": data.get("volumen_total_l", 0),
+                                "duracion_seg": data.get("duracion_seg", 0),
+                            })
+                except Exception as e:
+                    print(f"[KAFKA][ERROR] hilo_telemetria procesando mensaje: {e}")
+        except Exception as e:
+            print(f"[KAFKA][ERROR] hilo_telemetria loop: {e}. Reintentando...")
+            time.sleep(1)
         time.sleep(0.2)
- 
- 
+
+
 def tratar_desconexion(id_ws: str, motivo: str):
     """Pasa la estacion a DESCONECTADA y, si estaba regando, avisa al operario."""
     with lock_riegos:
@@ -331,58 +361,76 @@ def hilo_estado_ws(broker: str):
     consumidor = crear_consumidor(TOPIC_ESTADO_WS, broker, group_id="central-estado-ws")
     print(f"[KAFKA] Escuchando estado de WS en '{TOPIC_ESTADO_WS}'...")
     while True:
-        for msg in consumidor:
-            data = msg.value
-            id_ws = data.get("id_ws")
-            evento = data.get("evento")
- 
-            # Consultamos (sin modificar) si esta estacion tenia un riego en curso.
-            with lock_riegos:
-                info_riego = riegos_activos.get(id_ws)
- 
-            if evento == "FUGA":
-                # Fuga: estado FUGA (bloquea nuevos riegos) y, si estaba regando, se detiene
-                # y se avisa al operario de que su riego fue INTERRUMPIDO.
-                db.set_estado(id_ws, "FUGA")
-                db.log_evento(f"FUGA detectada en {id_ws}. Riego bloqueado.")
-                if info_riego:
-                    enviar_comando(id_ws, "DETENER_RIEGO")
-                    responder_operario(info_riego["id_operador"], {
-                        "request_id": info_riego["request_id"], "id_ws": id_ws,
-                        "evento": "INTERRUMPIDO", "motivo": "Fuga detectada durante el riego.",
-                    })
+        try:
+            for msg in consumidor:
+                try:
+                    data = msg.value
+                    id_ws = data.get("id_ws")
+                    evento = data.get("evento")
+
+                    if not id_ws or not evento:
+                        print(f"[KAFKA][WARN] Mensaje estado-ws sin id_ws o evento: {data}")
+                        continue
+
+                    # Consultamos (sin modificar) si esta estacion tenia un riego en curso.
                     with lock_riegos:
-                        riegos_activos.pop(id_ws, None)
- 
-            elif evento == "FUGA_RESUELTA":
-                # Averia arreglada: vuelve a DISPONIBLE (salvo que hubiera un riego activo).
-                if not info_riego:
-                    db.set_estado(id_ws, "DISPONIBLE")
-                db.log_evento(f"Averia resuelta en {id_ws}. Estacion disponible de nuevo.")
- 
-            elif evento == "DESCONECTADO":
-                # El Engine se desconecto del Monitor: DESCONECTADA y, si habia riego,
-                # se avisa al operario.
-                tratar_desconexion(id_ws, "El Engine ha cortado la conexion.")
- 
-            elif evento == "CONECTADO":
-                # El Monitor volvio: la estacion pasa a DISPONIBLE.
-                db.set_estado(id_ws, "DISPONIBLE")
-                db.log_evento(f"{id_ws} reconectada a CENTRAL.")
+                        info_riego = riegos_activos.get(id_ws)
+
+                    if evento == "FUGA":
+                        # Fuga: estado FUGA (bloquea nuevos riegos) y, si estaba regando, se detiene
+                        # y se avisa al operario de que su riego fue INTERRUMPIDO.
+                        db.set_estado(id_ws, "FUGA")
+                        db.log_evento(f"FUGA detectada en {id_ws}. Riego bloqueado.")
+                        if info_riego:
+                            enviar_comando(id_ws, "DETENER_RIEGO")
+                            responder_operario(info_riego["id_operador"], {
+                                "request_id": info_riego["request_id"], "id_ws": id_ws,
+                                "evento": "INTERRUMPIDO", "motivo": "Fuga detectada durante el riego.",
+                            })
+                            with lock_riegos:
+                                riegos_activos.pop(id_ws, None)
+
+                    elif evento == "FUGA_RESUELTA":
+                        # Averia arreglada: vuelve a DISPONIBLE (salvo que hubiera un riego activo).
+                        if not info_riego:
+                            db.set_estado(id_ws, "DISPONIBLE")
+                        db.log_evento(f"Averia resuelta en {id_ws}. Estacion disponible de nuevo.")
+
+                    elif evento == "DESCONECTADO":
+                        # El Engine se desconecto del Monitor: DESCONECTADA y, si habia riego,
+                        # se avisa al operario.
+                        tratar_desconexion(id_ws, "El Engine ha cortado la conexion.")
+
+                    elif evento == "CONECTADO":
+                        # El Monitor volvio: la estacion pasa a DISPONIBLE.
+                        db.set_estado(id_ws, "DISPONIBLE")
+                        db.log_evento(f"{id_ws} reconectada a CENTRAL.")
+
+                    else:
+                        print(f"[KAFKA][WARN] Evento desconocido en estado-ws: {evento!r} para {id_ws}")
+
+                except Exception as e:
+                    print(f"[KAFKA][ERROR] hilo_estado_ws procesando mensaje: {e}")
+        except Exception as e:
+            print(f"[KAFKA][ERROR] hilo_estado_ws loop: {e}. Reintentando...")
+            time.sleep(1)
         time.sleep(0.2)
- 
- 
+
+
 def hilo_broadcast(intervalo: float = 2.0):
     """Publica periodicamente el estado global de la red (lo usan los WM_FO)."""
     while True:
-        # Foto de todas las estaciones, publicada cada 'intervalo' segundos para que
-        # los WM_FO puedan mostrar el estado de la red sin consultar la BD.
-        estaciones = db.get_todas_estaciones()
-        productor.send(TOPIC_BROADCAST, value={"estaciones": estaciones, "timestamp": time.time()})
-        productor.flush()
+        try:
+            # Foto de todas las estaciones, publicada cada 'intervalo' segundos para que
+            # los WM_FO puedan mostrar el estado de la red sin consultar la BD.
+            estaciones = db.get_todas_estaciones()
+            productor.send(TOPIC_BROADCAST, value={"estaciones": estaciones, "timestamp": time.time()})
+            productor.flush()
+        except Exception as e:
+            print(f"[KAFKA][ERROR] hilo_broadcast: {e}")
         time.sleep(intervalo)
- 
- 
+
+
 # ============================================================== ACCIONES ===
 # API interna usada por el dashboard web (botones de CENTRAL, punto 11 del enunciado)
 # Cada funcion devuelve (ok, mensaje). Se las pasamos a Flask en crear_app().
