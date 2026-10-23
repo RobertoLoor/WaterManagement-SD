@@ -2,6 +2,29 @@
 """
 WM_FO - Aplicacion del operario de campo (Field Operator).
 
+Patron de comunicación: solo Kafka, nunca sockets directos.
+------------------------------------------------------------
+WM_FO es el único componente del sistema que NO usa sockets TCP.
+Toda su comunicación con WM_Central pasa por los topics Kafka:
+
+  ESCRIBE  en 'riego-peticiones'  → pide a CENTRAL que active el riego de una WS.
+  LEE      de 'central-broadcast' → recibe cada 2 s el estado de todas las WS.
+  LEE      de 'riego-respuestas'  → recibe las respuestas de CENTRAL:
+                                    AUTORIZADO, DENEGADO, RESUMEN, INTERRUMPIDO.
+
+Esta arquitectura tiene varias ventajas:
+  - WM_FO puede estar en cualquier máquina (solo necesita acceso al broker Kafka).
+  - Si CENTRAL está momentáneamente caída, las peticiones quedan en Kafka y se
+    procesan en cuanto CENTRAL vuelva.
+  - Pueden ejecutarse múltiples instancias de WM_FO en paralelo sin conflictos.
+
+Hilos:
+  - Hilo principal : muestra el menú interactivo (o ejecuta el fichero en modo auto).
+  - hilo_broadcast  : mantiene actualizado el diccionario estaciones_conocidas.
+  - hilo_respuestas : muestra por pantalla las respuestas de CENTRAL.
+
+El "request_id" (UUID) une cada petición con su respuesta (correlación).
+
 Permite al operario:
  - Consultar el estado de todas las estaciones de riego (WS) disponibles.
  - Solicitar la activacion manual del riego de una WS concreta.
@@ -56,21 +79,32 @@ from utils.kafka_utils import (
     TOPIC_PETICIONES, TOPIC_RESPUESTAS, TOPIC_BROADCAST,
 )
 
-# Ultimo estado conocido de cada estacion (lo rellena hilo_broadcast).
+# Último estado conocido de cada estación (lo rellena hilo_broadcast).
+# Estructura: { "WS-01": {"id_ws": "WS-01", "estado": "DISPONIBLE", ...}, ... }
+# Se actualiza cada ~2 s con el broadcast de CENTRAL. Protegido con lock para
+# evitar condiciones de carrera entre hilo_broadcast (escritura) y el menú (lectura).
 estaciones_conocidas = {}          # id_ws -> dict con su ultimo estado conocido
 lock_estaciones = threading.Lock()
 
-# Peticiones enviadas que esperan respuesta (solo se usa en el modo fichero).
-# Cada una lleva un threading.Event: el hilo del fichero se bloquea en .wait() y
-# el hilo de respuestas lo libera con .set() cuando llega la respuesta final.
+# Peticiones enviadas que están esperando respuesta (solo en modo fichero).
+# Estructura: { "uuid": {"event": threading.Event, "resultado": None|dict} }
+# Flujo:
+#   1. solicitar_riego() crea una entrada con event sin activar.
+#   2. El hilo del fichero llama a event.wait(timeout) y se bloquea.
+#   3. hilo_respuestas recibe DENEGADO/RESUMEN/INTERRUMPIDO, guarda el resultado
+#      y activa el event con .set().
+#   4. El hilo del fichero se despierta y lee el resultado.
 resultados_pendientes = {}         # request_id -> {"event":..., "resultado": None}
 lock_resultados = threading.Lock()
 
 
 def hilo_broadcast(kafka_broker):
     """Mantiene actualizado el listado de todas las WS (disponibles o no)."""
-    # group_id=None: no se guarda progreso en Kafka; con desde_inicio=False solo
-    # llegan mensajes nuevos. Nos basta: el broadcast se repite cada 2 s.
+    # group_id=None: no se guarda progreso en Kafka; cada vez que arranca WM_FO
+    # empieza de nuevo (no importa repetir mensajes de estado).
+    # desde_inicio=False (defecto): solo se leen mensajes NUEVOS, no el historial.
+    # Esto es correcto porque CENTRAL publica el estado completo cada 2 s; el
+    # mensaje más reciente siempre tendrá la información actualizada.
     consumidor = crear_consumidor(TOPIC_BROADCAST, kafka_broker, group_id=None)
     while True:
         try:
@@ -141,7 +175,9 @@ def hilo_respuestas(kafka_broker, id_operador):
 
 
 def solicitar_riego(productor, id_operador, id_ws, duracion_seg, esperar_resultado=False, timeout=None):
-    # Cada peticion lleva un identificador unico para casar luego la respuesta.
+    # Cada peticion lleva un identificador unico (UUID) que permite a CENTRAL y a WM_FO
+    # correlacionar la respuesta con la peticion original. Sin este id, si hubiera varias
+    # peticiones pendientes no se sabria a cuál corresponde cada respuesta.
     request_id = str(uuid.uuid4())
     evento_resultado = threading.Event()
     with lock_resultados:
@@ -156,6 +192,8 @@ def solicitar_riego(productor, id_operador, id_ws, duracion_seg, esperar_resulta
     print(f"[FO {id_operador}] Peticion enviada: activar {id_ws} durante {duracion_seg}s.")
 
     # Modo bloqueante (fichero): esperamos a la respuesta final o al timeout.
+    # En el modo interactivo (menú), esperar_resultado=False: la respuesta se
+    # imprime sola desde hilo_respuestas sin bloquear el menú.
     if esperar_resultado:
         evento_resultado.wait(timeout=timeout)
         with lock_resultados:
@@ -166,6 +204,8 @@ def solicitar_riego(productor, id_operador, id_ws, duracion_seg, esperar_resulta
 
 def mostrar_estaciones():
     # Imprime una tabla con lo ultimo recibido por el broadcast de CENTRAL.
+    # El formato usa anchos fijos (<N = alineado a la izquierda en N caracteres)
+    # para que la tabla quede alineada en la consola independientemente de los datos.
     with lock_estaciones:
         if not estaciones_conocidas:
             print("(Aun no se ha recibido informacion de CENTRAL. Espera unos segundos...)")
@@ -189,19 +229,27 @@ def ejecutar_fichero(productor, id_operador, ruta_fichero):
         id_ws = act["id_ws"]
         duracion = act.get("duracion_seg", 60)
         print(f"\n[FO {id_operador}] ({i}/{len(activaciones)}) Solicitando activacion de {id_ws}...")
-        # timeout = duracion + 30 s de margen por si CENTRAL no responde.
+        # timeout = duracion + 30 s de margen:
+        #   - La petición tarda tiempo en llegar a CENTRAL, procesarse y responderse.
+        #   - El riego en sí puede durar hasta 'duracion' segundos.
+        #   - Los 30 s extra cubren latencia de red y posibles retrasos de Kafka.
+        #   - Si se supera el timeout, se asume que CENTRAL no va a responder y se pasa
+        #     a la siguiente activación para no bloquear el fichero indefinidamente.
         resultado = solicitar_riego(productor, id_operador, id_ws, duracion,
                                      esperar_resultado=True, timeout=duracion + 30)
         if resultado is None:
             print(f"[FO {id_operador}] Sin respuesta de CENTRAL para {id_ws} (timeout).")
         # Pausa de 4 s entre peticiones, como pide el enunciado.
+        # Evita saturar CENTRAL con peticiones consecutivas y da tiempo a que
+        # el estado de la estación se actualice en el broadcast antes de la siguiente.
         print(f"[FO {id_operador}] Esperando 4s antes de la siguiente peticion...")
         time.sleep(4)
     print(f"[FO {id_operador}] Fichero de activaciones completado.")
 
 
 def menu(productor, id_operador, ruta_fichero_defecto=None):
-    # Bucle infinito del menu interactivo (input() bloquea hasta que escribes).
+    # Bucle infinito del menu interactivo (input() bloquea hasta que escribes)
+    # mientras los hilos hilo_broadcast y hilo_respuestas siguen corriendo en segundo plano.
     while True:
         print("\n===== WM_FO - Menu del operario =====")
         print("1) Ver estaciones (disponibles y su estado)")
@@ -230,7 +278,12 @@ def menu(productor, id_operador, ruta_fichero_defecto=None):
                 print(f"No se encontro el fichero '{ruta}'.")
         elif opcion == "4":
             print("Hasta luego.")
-            # os._exit termina en seco (incluidos los hilos daemon de fondo).
+            # os._exit(0) termina en seco: mata TODOS los hilos del proceso inmediatamente,
+            # incluidos los daemon. Es necesario porque los hilos de Kafka tienen bucles
+            # infinitos que no tienen una condición de parada limpia.
+            # Diferencia con sys.exit(): sys.exit() lanza SystemExit, que puede ser capturada
+            # por un try/except en cualquier hilo, lo que puede provocar que el proceso no
+            # termine realmente. os._exit() es una llamada al SO que no se puede interceptar.
             os._exit(0)
         else:
             print("Opcion no valida.")

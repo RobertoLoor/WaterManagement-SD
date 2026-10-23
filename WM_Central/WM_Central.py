@@ -1,7 +1,7 @@
 # WM_Central/WM_Central.py
 """
 WM_Central - Nucleo del sistema WaterManagement.
- 
+
 Responsabilidades:
  - Servidor de sockets (protocolo STX/ETX/LRC) para el registro/autenticacion
    de los Monitores de las estaciones de riego (WM_WS_M).
@@ -14,10 +14,29 @@ Responsabilidades:
      * emitir un "broadcast" periodico con el estado global de la red
  - Persistencia en SQLite (utils/db.py).
  - Panel de monitorizacion web (Flask) en tiempo real (polling 1s).
- 
+
+Hilos y responsabilidades:
+  1. servidor_sockets  : hilo daemon que acepta conexiones TCP de los Monitores
+                         (WM_WS_M). Por cada conexion lanza un hilo atender_monitor().
+  2. hilo_peticiones   : consumidor Kafka del topic 'riego-peticiones'.
+                         Valida y autoriza (o deniega) las solicitudes de los operarios.
+  3. hilo_telemetria   : consumidor Kafka del topic 'telemetria-riego'.
+                         Actualiza caudal/volumen en BD y gestiona los avisos de fin de riego.
+  4. hilo_estado_ws    : consumidor Kafka del topic 'estado-ws'.
+                         Procesa eventos de salud enviados por los Monitores
+                         (FUGA, FUGA_RESUELTA, CONECTADO, DESCONECTADO).
+  5. hilo_broadcast    : cada 2 s publica el estado de todas las estaciones en
+                         'central-broadcast' para que los WM_FO puedan mostrarlo.
+  +  Flask (dashboard) : el hilo principal de Python sirve la web en el puerto web.
+
+Flujo tipico de un riego:
+  WM_FO --(riego-peticiones)--> Central --valida--> --(comandos-estacion)--> Engine
+  Engine --(telemetria-riego)--> Central --> BD --> dashboard
+  Engine --(RIEGO_FINALIZADO)--> Central --(riego-respuestas RESUMEN)--> WM_FO
+
 Uso:
     python WM_Central.py <puerto_sockets> <kafka_broker> [puerto_web]
- 
+
 Variables de entorno equivalentes (usadas por defecto si no hay argumentos,
 utiles para Docker): SOCKET_PORT, KAFKA_BROKER, WEB_PORT, DB_PATH
 
@@ -30,7 +49,7 @@ import socket
 import threading
 import time
 import uuid
- 
+
 # ---------------------------------------------------------------------------
 # VISION GENERAL PARA ESTUDIAR
 # ---------------------------------------------------------------------------
@@ -49,7 +68,7 @@ import uuid
 #   Engine --(telemetria-riego)--> Central --> BD --> dashboard
 #   Engine --(RIEGO_FINALIZADO)--> Central --(riego-respuestas RESUMEN)--> WM_FO
 # ---------------------------------------------------------------------------
- 
+
 # --- localizar la raiz del proyecto (carpeta que contiene utils/) ---------
 # Este script vive en WM_Central/, pero 'utils/' esta un nivel por encima. Subimos
 # de carpeta en carpeta hasta encontrar 'utils' y anadimos esa carpeta al
@@ -71,7 +90,7 @@ while True:
             f"{sorted(os.listdir(os.path.dirname(_inicio)))}"
         )
     dir_cursor = parent
- 
+
 # Modulos propios (solo se pueden importar despues de arreglar el sys.path de arriba).
 from utils.protocol import (
     empaquetar_trama, desempaquetar_trama, recv_exact_frame,
@@ -83,31 +102,62 @@ from utils.kafka_utils import (
     TOPIC_PETICIONES, TOPIC_RESPUESTAS, TOPIC_BROADCAST,
 )
 from utils.db import Database
- 
+
 # ---------------------------------------------------------------- estado ---
-# Solo se puede iniciar un riego si la estacion esta DISPONIBLE.
+# Set (conjunto) de estados que permiten iniciar un riego.
+# ¿Por qué un set y no una lista?
+# La operación crítica es "estado in ESTADOS_QUE_PERMITEN_RIEGO", que en un set
+# es O(1) (tiempo constante) frente a O(n) en una lista. Con los estados actuales
+# la diferencia es insignificante, pero el set también expresa semánticamente
+# que no importa el orden y que no hay duplicados: es la estructura correcta.
 ESTADOS_QUE_PERMITEN_RIEGO = {"DISPONIBLE"}
-# Riegos en curso en memoria: clave = id de la estacion. Guarda quien lo pidio
-# y con que request_id, para poder responderle luego (resumen o interrupcion).
+
+# Diccionario de riegos en curso: clave = id_ws, valor = dict con:
+#   {
+#     "request_id"  : str  → UUID de la solicitud original de WM_FO (correlaciona
+#                            petición con respuesta AUTORIZADO/RESUMEN/INTERRUMPIDO).
+#     "id_operador" : str  → quién pidió el riego (para enviarle el RESUMEN al acabar).
+#     "duracion_seg": int  → duración solicitada (informativa, el Engine la controla).
+#   }
+# Protegido por lock_riegos porque lo leen/escriben varios hilos a la vez.
 riegos_activos = {}   # id_ws -> {request_id, id_operador, duracion_seg}
-# Conexion de socket abierta de cada Monitor: id_ws -> socket. Mientras siga abierta
-# y el Monitor mande latidos (ENQ), la estacion esta conectada; si se cierra o
-# enmudece, CENTRAL la marca DESCONECTADA.
+
+# Diccionario de sockets abiertos de cada Monitor: id_ws -> socket TCP.
+# Mientras la conexión esté abierta y el Monitor mande latidos (ENQ cada 5 s),
+# se sabe que la estación sigue viva. Si el socket se cierra o el Monitor enmudece
+# más de TIMEOUT_MONITOR segundos, atender_monitor() llama a tratar_desconexion().
+# Guardar el socket (en vez de solo un booleano) permite además detectar si una
+# reconexión tardía sobreescribe la entrada del diccionario: si el socket actual
+# no es el mismo objeto que el que teníamos al registrar, es una reconexión nueva.
 conexiones_ws = {}
+
 # Segundos sin recibir nada de un Monitor tras los cuales se le da por desconectado
 # (el Monitor manda un latido ENQ cada 5 s).
 TIMEOUT_MONITOR = 15
+
 # Lock para proteger 'riegos_activos', que tocan varios hilos a la vez.
 lock_riegos = threading.Lock()
- 
+
 # Variables globales que se inicializan en main(): base de datos y productor Kafka.
 db: Database = None
 productor = None
- 
- 
+
+
 # ============================================================ SOCKETS =====
 def atender_monitor(conn, addr):
-    """Atiende la conexion de un Monitor (WM_WS_M): ENQ -> ACK, registro -> alta en BD."""
+    """
+    Atiende la conexion persistente de un Monitor (WM_WS_M).
+
+    Protocolo de registro (flujo ENQ->ACK->REGISTRO->REGISTRO_OK):
+      1. Monitor envía ENQ ("¿estás ahí?") → CENTRAL responde ACK.
+      2. Monitor envía trama REGISTRO#id_ws#ubicacion → CENTRAL responde ACK (LRC ok).
+      3. CENTRAL envía trama REGISTRO_OK#id_ws (confirmación con el id asignado).
+      4. La conexion queda ABIERTA: el Monitor manda ENQ periódicos (latidos) y
+         CENTRAL responde ACK. Si el Monitor deja de mandar latidos más de
+         TIMEOUT_MONITOR segundos, se da por caído.
+
+    Se ejecuta en su propio hilo daemon (uno por Monitor conectado).
+    """
     print(f"[SOCKET] Nueva conexion de Monitor desde {addr}")
     id_registrado = None   # id de la estacion que se registro por ESTA conexion
     try:
@@ -119,7 +169,7 @@ def atender_monitor(conn, addr):
                 # Cadena vacia = el Monitor cerro la conexion.
                 print(f"[SOCKET] Monitor {addr} desconectado.")
                 break
- 
+
             # Dialogo del protocolo: ENQ ("¿estas ahi?") se responde con ACK.
             if datos == ENQ:
                 conn.sendall(ACK)
@@ -127,7 +177,7 @@ def atender_monitor(conn, addr):
             # EOT = el Monitor termina la comunicacion.
             if datos == EOT:
                 break
- 
+
             # Si es una trama de datos, comprobamos que el LRC es correcto.
             es_valido, mensaje = desempaquetar_trama(datos)
             if not es_valido:
@@ -135,15 +185,15 @@ def atender_monitor(conn, addr):
                 print(f"[SOCKET] Trama corrupta de {addr}")
                 conn.sendall(NACK)
                 continue
- 
+
             # Trama valida: confirmamos con ACK y procesamos el contenido.
             conn.sendall(ACK)
             print(f"[SOCKET] Mensaje de {addr}: {mensaje}")
- 
+
             # Los mensajes tienen la forma COMANDO#campo1#campo2...
             partes = mensaje.split('#')
             comando = partes[0]
- 
+
             if comando == "REGISTRO":
                 # REGISTRO#WS-01#River Park -> damos de alta (o reactivamos) la estacion.
                 id_ws = partes[1] if len(partes) > 1 else "WS-DESCONOCIDA"
@@ -170,14 +220,19 @@ def atender_monitor(conn, addr):
         if id_registrado and conexiones_ws.get(id_registrado) is conn:
             conexiones_ws.pop(id_registrado, None)
             tratar_desconexion(id_registrado, "El Monitor ha perdido la conexion con CENTRAL.")
- 
- 
+
+
 def servidor_sockets(puerto: int):
     # Crea un socket TCP (AF_INET = IPv4, SOCK_STREAM = TCP).
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # SO_REUSEADDR: permite reutilizar el puerto al reiniciar sin esperar.
+    # SO_REUSEADDR: permite reutilizar el puerto inmediatamente al reiniciar el proceso.
+    # Sin esta opción, el SO puede mantener el puerto en estado TIME_WAIT hasta 4
+    # minutos tras cerrar el proceso anterior, impidiendo arrancar de nuevo.
+    # Indispensable en Railway, donde los reinicios son frecuentes.
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    # '0.0.0.0' = escuchar en todas las interfaces (necesario en Docker/Railway).
+    # '0.0.0.0' = escuchar en TODAS las interfaces de red disponibles en el contenedor.
+    # Necesario en Docker/Railway: si se pusiera '127.0.0.1' (loopback), los Monitores
+    # externos no podrían conectarse porque solo alcanzarían la IP pública del contenedor.
     s.bind(('0.0.0.0', puerto))
     s.listen()
     print(f"[WM_CENTRAL] Servidor de sockets escuchando en el puerto {puerto}...")
@@ -186,13 +241,18 @@ def servidor_sockets(puerto: int):
         # se le asigna su propio hilo para poder atender varios a la vez.
         conn, addr = s.accept()
         threading.Thread(target=atender_monitor, args=(conn, addr), daemon=True).start()
- 
- 
+
+
 # ============================================================== KAFKA =====
 def enviar_comando(id_ws: str, comando: str, duracion_seg: int = None, operario: str = None):
     # Publica una orden para el Engine de la estacion (INICIAR_RIEGO, DETENER_RIEGO,
     # BLOQUEAR, ACTIVAR). key=id_ws hace que todos los comandos de una estacion
     # vayan a la misma particion y se mantenga su orden.
+    # ¿Por qué key=id_ws?
+    # Kafka garantiza el orden de mensajes DENTRO de una misma partición.
+    # Al usar el id de la estación como key, todos los comandos para esa estación
+    # van a la misma partición y el Engine los recibe en el orden en que CENTRAL los envió.
+    # Esto evita, por ejemplo, que un DETENER_RIEGO llegue antes que el INICIAR_RIEGO.
     productor.send(TOPIC_COMANDOS, key=id_ws, value={
         "id_ws": id_ws, "comando": comando,
         "duracion_seg": duracion_seg, "operario": operario,
@@ -200,17 +260,30 @@ def enviar_comando(id_ws: str, comando: str, duracion_seg: int = None, operario:
     })
     # flush() fuerza el envio inmediato (send es asincrono y agrupa mensajes).
     productor.flush()
- 
- 
+
+
 def responder_operario(id_operador: str, payload: dict):
+    """
+    Envía una respuesta a un operario de campo (WM_FO) a través de Kafka.
+
+    Se añade id_operador y timestamp al payload para que cada WM_FO pueda
+    filtrar los mensajes que le corresponden (el topic es compartido por todos
+    los operarios) y mostrar la hora correcta.
+
+    Tipos de evento en el payload:
+      AUTORIZADO   → el riego ha sido aprobado e iniciado.
+      DENEGADO     → no se puede regar (estación ocupada, bloqueada, etc.).
+      RESUMEN      → el riego terminó; incluye volumen total y duración real.
+      INTERRUMPIDO → el riego fue cortado (fuga, desconexión, bloqueo manual).
+    """
     # Envia una respuesta (AUTORIZADO, DENEGADO, RESUMEN, INTERRUMPIDO) a un operario.
     # Se anade a quien va dirigida para que cada WM_FO filtre lo suyo.
     payload["id_operador"] = id_operador
     payload["timestamp"] = time.time()
     productor.send(TOPIC_RESPUESTAS, key=id_operador, value=payload)
     productor.flush()
- 
- 
+
+
 def hilo_peticiones(broker: str):
     """Escucha las peticiones de riego que envian los operarios (WM_FO)."""
     # group_id fijo: Kafka recuerda hasta donde ha leido este grupo.
@@ -251,7 +324,8 @@ def hilo_peticiones(broker: str):
                     with lock_riegos:
                         ya_regando = id_ws in riegos_activos
 
-                    # CASO 1: la estacion no existe en la BD -> denegamos.
+                    # CASO 1: la estacion no existe en la BD (nunca se ha registrado un Monitor
+                    # con ese id_ws). No podemos enviar un comando a algo que no conocemos.
                     if not estacion:
                         responder_operario(id_operador, {
                             "request_id": request_id, "id_ws": id_ws, "evento": "DENEGADO",
@@ -259,7 +333,9 @@ def hilo_peticiones(broker: str):
                         })
                         continue
 
-                    # CASO 2: existe pero no esta disponible (regando, fuga, bloqueada, desconectada).
+                    # CASO 2: la estacion existe pero no está en un estado que permita regar.
+                    # Puede estar: ya regando (riegos_activos), en fuga, bloqueada o desconectada.
+                    # Se da un motivo específico según el estado para que el operario entienda por qué.
                     if ya_regando or estacion["estado"] not in ESTADOS_QUE_PERMITEN_RIEGO:
                         # Mensaje de motivo segun el estado actual.
                         motivos = {
@@ -316,11 +392,16 @@ def hilo_telemetria(broker: str):
                     tipo = data.get("tipo", "TELEMETRIA")
 
                     if tipo == "TELEMETRIA":
-                        # Lectura periodica durante el riego: guardamos caudal y volumen acumulado.
+                        # Lectura periódica durante el riego (cada ~1 segundo):
+                        # guardamos el caudal instantáneo y el volumen acumulado en la BD.
+                        # El dashboard de Flask lo lee en cada poll y actualiza la tabla.
                         db.set_telemetria(id_ws, data.get("caudal_lmin", 0), data.get("volumen_total_l", 0))
 
                     elif tipo == "RIEGO_FINALIZADO":
-                        # El riego termino (por tiempo, manual, fuga...): estacion vuelve a DISPONIBLE.
+                        # El Engine ha terminado el riego (por tiempo, orden manual, fuga o bloqueo).
+                        # A diferencia de TELEMETRIA, este tipo es un evento ÚNICO por riego:
+                        # indica que la electroválvula se ha cerrado y el Engine ha publicado el resumen.
+                        # Se finaliza el riego en BD (estado vuelve a DISPONIBLE si seguía REGANDO).
                         db.finalizar_riego(id_ws)
                         # Sacamos el riego de la lista de activos (pop devuelve lo que habia, o None).
                         with lock_riegos:
@@ -344,7 +425,22 @@ def hilo_telemetria(broker: str):
 
 
 def tratar_desconexion(id_ws: str, motivo: str):
-    """Pasa la estacion a DESCONECTADA y, si estaba regando, avisa al operario."""
+    """
+    Gestiona la desconexión de una estación de riego.
+
+    Acciones que realiza:
+      1. Elimina el riego activo de la memoria (si lo hubiera), para liberar
+         la estación y no bloquear futuras peticiones.
+      2. Marca la estación como DESCONECTADA en la BD.
+      3. Registra el evento en el historial del dashboard.
+      4. Si había un riego en curso, notifica al operario que su riego fue
+         INTERRUMPIDO (con el motivo de la desconexión) para que sepa que
+         la petición no llegó a completarse.
+
+    Se llama desde dos lugares:
+      - atender_monitor() → cuando la conexión TCP del Monitor se cierra o expira.
+      - hilo_estado_ws()  → cuando el Monitor publica el evento DESCONECTADO por Kafka.
+    """
     with lock_riegos:
         info_riego = riegos_activos.pop(id_ws, None)
     db.marcar_desconectada(id_ws)
@@ -377,8 +473,11 @@ def hilo_estado_ws(broker: str):
                         info_riego = riegos_activos.get(id_ws)
 
                     if evento == "FUGA":
-                        # Fuga: estado FUGA (bloquea nuevos riegos) y, si estaba regando, se detiene
-                        # y se avisa al operario de que su riego fue INTERRUMPIDO.
+                        # El Monitor detectó que su Engine responde KO o no responde.
+                        # → Estado FUGA en BD: bloquea nuevas peticiones de riego.
+                        # → Si había riego activo: se ordena DETENER_RIEGO al Engine y se
+                        #   notifica INTERRUMPIDO al operario. La fuga tiene prioridad
+                        #   sobre cualquier riego en curso.
                         db.set_estado(id_ws, "FUGA")
                         db.log_evento(f"FUGA detectada en {id_ws}. Riego bloqueado.")
                         if info_riego:
@@ -391,18 +490,23 @@ def hilo_estado_ws(broker: str):
                                 riegos_activos.pop(id_ws, None)
 
                     elif evento == "FUGA_RESUELTA":
-                        # Averia arreglada: vuelve a DISPONIBLE (salvo que hubiera un riego activo).
+                        # La avería se ha reparado y el Engine vuelve a responder OK.
+                        # → Solo se pone DISPONIBLE si NO hay riego activo (caso improbable
+                        #   pero posible si un segundo hilo autorizó un riego justo en este
+                        #   momento). Si hay riego, el estado lo gestiona hilo_telemetria.
                         if not info_riego:
                             db.set_estado(id_ws, "DISPONIBLE")
                         db.log_evento(f"Averia resuelta en {id_ws}. Estacion disponible de nuevo.")
 
                     elif evento == "DESCONECTADO":
-                        # El Engine se desconecto del Monitor: DESCONECTADA y, si habia riego,
-                        # se avisa al operario.
+                        # El Engine se desconectó del Monitor (el Monitor cerró la sesión
+                        # con el Engine o el Engine cayó). La estación queda DESCONECTADA
+                        # y, si había riego, el operario recibe INTERRUMPIDO.
                         tratar_desconexion(id_ws, "El Engine ha cortado la conexion.")
 
                     elif evento == "CONECTADO":
-                        # El Monitor volvio: la estacion pasa a DISPONIBLE.
+                        # El Monitor informa de que su Engine acaba de conectarse (o reconectarse).
+                        # La estación pasa de DESCONECTADA a DISPONIBLE: ya puede recibir riegos.
                         db.set_estado(id_ws, "DISPONIBLE")
                         db.log_evento(f"{id_ws} reconectada a CENTRAL.")
 
@@ -418,7 +522,17 @@ def hilo_estado_ws(broker: str):
 
 
 def hilo_broadcast(intervalo: float = 2.0):
-    """Publica periodicamente el estado global de la red (lo usan los WM_FO)."""
+    """
+    Publica periodicamente el estado global de la red en el topic 'central-broadcast'.
+
+    ¿Para qué sirve el broadcast y quién lo consume?
+    Los WM_FO no tienen acceso directo a la base de datos de CENTRAL (están en
+    procesos distintos, potencialmente en máquinas distintas). Para que puedan
+    mostrar el estado de todas las estaciones, CENTRAL publica periódicamente
+    (cada 2 segundos) una "foto" completa con la lista de estaciones y sus
+    estados actuales. Cada WM_FO la consume en su hilo_broadcast() y actualiza
+    su diccionario local estaciones_conocidas.
+    """
     while True:
         try:
             # Foto de todas las estaciones, publicada cada 'intervalo' segundos para que
@@ -435,6 +549,19 @@ def hilo_broadcast(intervalo: float = 2.0):
 # API interna usada por el dashboard web (botones de CENTRAL, punto 11 del enunciado)
 # Cada funcion devuelve (ok, mensaje). Se las pasamos a Flask en crear_app().
 def accion_iniciar_riego(id_ws: str, duracion_seg: int = 60):
+    """
+    Inicia un riego manualmente desde el dashboard web de CENTRAL.
+
+    Equivalente a recibir una petición de un operario, pero el "operario" es
+    la propia CENTRAL. El riego se registra en riegos_activos con id_operador='CENTRAL',
+    por lo que el resumen final también queda registrado (aunque no se envía a ningún
+    WM_FO, dado que CENTRAL no es un operario de campo).
+
+    :param id_ws:       Id de la estación a regar.
+    :param duracion_seg: Duración del riego en segundos (defecto 60).
+    :returns: (True, "Riego iniciado.") si tuvo éxito,
+              (False, motivo) si la estación no está disponible.
+    """
     # Boton "Regar": igual que aceptar una peticion, pero el operario es "CENTRAL".
     estacion = db.get_estacion(id_ws)
     if not estacion or estacion["estado"] not in ESTADOS_QUE_PERMITEN_RIEGO:
@@ -446,9 +573,23 @@ def accion_iniciar_riego(id_ws: str, duracion_seg: int = 60):
     enviar_comando(id_ws, "INICIAR_RIEGO", duracion_seg=duracion_seg, operario="CENTRAL")
     db.log_evento(f"Riego iniciado manualmente en {id_ws} desde CENTRAL.")
     return True, "Riego iniciado."
- 
- 
+
+
 def accion_bloquear(id_ws: str):
+    """
+    Bloquea una estación desde el dashboard (la pone FUERA_DE_SERVICIO).
+
+    Si había un riego en curso, se cancela (el Engine recibe DETENER_RIEGO
+    implícitamente al ponerse fuera de servicio). Se usa para mantenimiento
+    o para prevenir el uso de una estación con problemas físicos.
+
+    No se puede bloquear una estación DESCONECTADA: no sabemos si hay
+    alguien escuchando en el otro extremo, y no tiene sentido cambiar su
+    estado hasta que se reconecte.
+
+    :param id_ws: Id de la estación a bloquear.
+    :returns: (True, "Estacion bloqueada.") o (False, motivo).
+    """
     # Boton "Bloquear": pone la estacion FUERA_DE_SERVICIO y cancela cualquier riego activo.
     estacion = db.get_estacion(id_ws)
     if not estacion:
@@ -462,9 +603,20 @@ def accion_bloquear(id_ws: str):
         riegos_activos.pop(id_ws, None)
     db.log_evento(f"{id_ws} puesta FUERA DE SERVICIO por CENTRAL.")
     return True, "Estacion bloqueada."
- 
- 
+
+
 def accion_activar(id_ws: str):
+    """
+    Desbloquea una estación previamente puesta FUERA_DE_SERVICIO.
+
+    La pone de nuevo en DISPONIBLE y envía el comando ACTIVAR al Engine
+    para que levante el bloqueo en su lado también.
+
+    No se puede activar una estación DESCONECTADA (mismo motivo que en bloquear).
+
+    :param id_ws: Id de la estación a activar.
+    :returns: (True, "Estacion activada.") o (False, motivo).
+    """
     # Boton "Activar": deshace el bloqueo y deja la estacion DISPONIBLE.
     estacion = db.get_estacion(id_ws)
     if not estacion:
@@ -475,12 +627,12 @@ def accion_activar(id_ws: str):
     db.set_estado(id_ws, "DISPONIBLE")
     db.log_evento(f"{id_ws} ACTIVADA de nuevo por CENTRAL.")
     return True, "Estacion activada."
- 
- 
+
+
 # ================================================================= MAIN ====
 def main():
     global db, productor
- 
+
     # Cada parametro se toma, por orden de prioridad, de: argumento de linea de
     # comandos -> variable de entorno -> valor por defecto. En Railway se usan las
     # variables de entorno (SOCKET_PORT, KAFKA_BROKER, DB_PATH y PORT para la web:
@@ -489,7 +641,7 @@ def main():
     kafka_broker = sys.argv[2] if len(sys.argv) > 2 else os.getenv("KAFKA_BROKER", "localhost:9093")
     puerto_web = int(sys.argv[3]) if len(sys.argv) > 3 else int(os.getenv("PORT") or os.getenv("WEB_PORT") or 8080)
     ruta_bd = os.getenv("DB_PATH", os.path.join(dir_cursor, "wm_central.db"))
- 
+
     # Banner de arranque: es lo primero que ves en los logs de Railway.
     print("=" * 60)
     print(" WM_Central - WaterManagement")
@@ -498,29 +650,38 @@ def main():
     print(f" Puerto web     : {puerto_web}")
     print(f" Base de datos  : {ruta_bd}")
     print("=" * 60)
- 
-    # 1) Base de datos y productor Kafka (si Kafka no responde, aqui salen los
-    #    "Broker no disponible aun" y, agotados los reintentos, el programa termina).
+
+    # PASO 1: Inicializar la base de datos.
+    # Si Kafka no responde al crear el productor, aquí salen los mensajes
+    # "Broker no disponible aun" y, agotados los reintentos, el programa termina.
     db = Database(ruta_bd)
-    # Punto 1 del enunciado: al (re)iniciar, las estaciones guardadas en la BD se
-    # muestran DESCONECTADAS hasta que cada una conecte de nuevo.
+    # Al (re)iniciar CENTRAL no sabemos el estado real de las estaciones: las marcamos
+    # todas DESCONECTADAS. Cada Monitor que se reconecte actualizará su estado.
     db.marcar_todas_desconectadas()
+
+    # PASO 2: Crear el productor Kafka (puede tardar si el broker aún no está listo).
     productor = crear_productor(kafka_broker)
- 
-    # 2) Arrancamos los hilos de fondo. daemon=True: se cierran solos al terminar el programa.
+
+    # PASO 3: Arrancar los hilos de fondo en modo daemon.
+    # daemon=True: al terminar el proceso principal (Flask) todos los hilos
+    # se cierran automáticamente, sin necesidad de pararlos manualmente.
     threading.Thread(target=servidor_sockets, args=(puerto_sockets,), daemon=True).start()
     threading.Thread(target=hilo_peticiones, args=(kafka_broker,), daemon=True).start()
     threading.Thread(target=hilo_telemetria, args=(kafka_broker,), daemon=True).start()
     threading.Thread(target=hilo_estado_ws, args=(kafka_broker,), daemon=True).start()
     threading.Thread(target=hilo_broadcast, daemon=True).start()
- 
-    # 3) El dashboard web se arranca en el hilo principal y mantiene vivo el programa.
-    # El dashboard web se importa aqui para evitar dependencias circulares
+
+    # PASO 4: Arrancar el dashboard web en el hilo principal.
+    # Flask.run() es bloqueante: mantiene vivo el proceso mientras sirve la web.
+    # threaded=True permite atender varias peticiones HTTP en paralelo (polling).
+    # El import se hace aquí (y no al principio) para evitar importaciones
+    # circulares: dashboard.py no importa WM_Central, pero si se pusiera el
+    # import arriba del fichero podría causar problemas con el sys.path.
     from dashboard import crear_app
     app = crear_app(db, accion_iniciar_riego, accion_bloquear, accion_activar)
     app.run(host="0.0.0.0", port=puerto_web, threaded=True)
- 
- 
+
+
 # Solo ejecuta main() si el fichero se lanza directamente (no si se importa).
 if __name__ == "__main__":
     main()

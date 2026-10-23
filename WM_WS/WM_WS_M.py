@@ -2,6 +2,31 @@
 """
 WM_WS_M - Monitor de una estacion de riego (Watering Station).
 
+Papel de intermediario:
+-----------------------
+El Monitor actúa como puente entre WM_Central y el Engine de su estación.
+Tiene DOS canales de comunicación simultáneos:
+  1. Canal hacia CENTRAL (cliente TCP): protocolo STX/ETX/LRC para el registro
+     inicial y los latidos periódicos.
+  2. Canal hacia el Engine (servidor TCP): protocolo STX/ETX/LRC para el
+     handshake de identidad y los latidos de comprobación de salud (PING/OK/KO).
+  3. Canal Kafka (productor): publica eventos de salud (FUGA, FUGA_RESUELTA,
+     CONECTADO, DESCONECTADO) hacia CENTRAL cuando el estado del Engine cambia.
+
+Diagrama de flujo:
+  CENTRAL <--sockets (una sola vez + latidos)--> MONITOR <--sockets (continuo)--> ENGINE
+                                                     |
+                                                     +--Kafka 'estado-ws'--> CENTRAL
+
+Protocolo de registro (flujo completo):
+  ENQ -> ACK -> trama REGISTRO -> ACK -> trama REGISTRO_OK
+
+¿Por qué se deja el socket abierto tras el registro?
+Porque la presencia de la conexión TCP indica que el Monitor sigue vivo.
+Si CENTRAL detecta que el socket se cierra (o que el Monitor deja de mandar
+latidos ENQ), sabe inmediatamente que la estación está sin supervisión y la
+marca DESCONECTADA.
+
 Responsabilidades:
  - Registrarse/autenticarse contra WM_Central via sockets (protocolo
    STX/ETX/LRC), enviando su Id y ubicacion.
@@ -26,9 +51,9 @@ import time
 # ---------------------------------------------------------------------------
 # El Monitor es un "intermediario" con dos caras:
 #
-#   CENTRAL <--sockets (una sola vez)-->  MONITOR  <--sockets (continuo)-->  ENGINE
-#                                             |
-#                                             +--Kafka 'estado-ws'--> CENTRAL
+#   CENTRAL <--sockets (una sola vez)--> MONITOR <--sockets (continuo)--> ENGINE
+#                                            |
+#                                            +--Kafka 'estado-ws'--> CENTRAL
 #
 #  1) Al arrancar se REGISTRA en CENTRAL por sockets (ENQ/ACK -> REGISTRO -> ACK -> REGISTRO_OK).
 #  2) Despues abre un servidor en 'puerto_engine' y espera a su Engine.
@@ -60,17 +85,45 @@ while True:
 from utils.protocol import empaquetar_trama, desempaquetar_trama, recv_exact_frame, ENQ, ACK, NACK
 from utils.kafka_utils import crear_productor, TOPIC_ESTADO_WS
 
-# Cada cuantos segundos se pregunta al Engine, y cuanto se espera su respuesta.
+# Intervalo (segundos) entre latidos PING enviados al Engine.
+# Reducir este valor detecta fugas más rápido pero genera más tráfico de red.
+# Con 1.0 s la detección de fuga tarda como máximo HEARTBEAT_TIMEOUT + 1 s.
 HEARTBEAT_INTERVALO = 1.0
+
+# Tiempo máximo (segundos) de espera de respuesta del Engine a cada PING.
+# Si el Engine no contesta en 3 s, se considera avería (FUGA).
+# Aumentar este valor hace el sistema más tolerante a latencia de red,
+# pero también retrasa la detección de fallos reales.
 HEARTBEAT_TIMEOUT = 3.0
+
 # Cada cuantos segundos el Monitor manda un latido (ENQ) a CENTRAL por la conexion
-# que mantiene abierta. CENTRAL da por desconectada la estacion si deja de recibirlos.
+# que mantiene abierta. CENTRAL da por desconectada la estacion si deja de recibirlos
+# (TIMEOUT_MONITOR en WM_Central = 15 s, con LATIDO_CENTRAL = 5 s hay margen de 2 latidos).
+# Si se reduce LATIDO_CENTRAL, CENTRAL detecta caídas más rápido pero hay más tráfico.
+# Si se aumenta, hay que aumentar también TIMEOUT_MONITOR en WM_Central.
 LATIDO_CENTRAL = 5.0
 
 
 def registrar_en_central(ip_central, puerto_central, id_ws, ubicacion):
-    """Se conecta a WM_Central y envia la trama de registro por sockets. Reintenta hasta
-    lograrlo y devuelve el socket, que se deja ABIERTO para los latidos."""
+    """
+    Conecta con WM_Central y ejecuta el protocolo de registro completo.
+
+    Protocolo paso a paso:
+      Paso 1: ENQ   → CENTRAL responde ACK  (handshake: "¿estás ahí?").
+      Paso 2: trama REGISTRO#id_ws#ubicacion → CENTRAL responde ACK (LRC ok).
+      Paso 3: CENTRAL envía trama REGISTRO_OK#id_ws (confirmación con nombre asignado).
+
+    ¿Por qué se deja el socket abierto?
+    La conexión TCP persistente es la señal de vida del Monitor.
+    mantener_enlace_central() usa este mismo socket para enviar latidos ENQ
+    periódicos. Si el socket se cierra (por caída del Monitor o de la red),
+    CENTRAL lo detecta en atender_monitor() y marca la estación DESCONECTADA.
+
+    Reintenta indefinidamente cada 5 s hasta lograrlo: es el comportamiento
+    correcto porque CENTRAL puede arrancar más tarde que el Monitor.
+
+    :returns: Socket TCP abierto y autenticado contra CENTRAL.
+    """
     # Bucle de reintentos: si CENTRAL no esta accesible, se vuelve a intentar cada 5 s.
     while True:
         try:
@@ -110,9 +163,20 @@ def registrar_en_central(ip_central, puerto_central, id_ws, ubicacion):
 
 
 def sincronizar_estado_con_central(productor, id_ws):
-    """Tras (re)registrarse, CENTRAL no sabe el estado real de la estacion (el registro
-    la deja DESCONECTADA). Si el Engine esta conectado, se lo contamos: CONECTADO y, si
-    hay una fuga en curso, FUGA. Si el Engine no esta, la estacion debe seguir DESCONECTADA."""
+    """
+    Informa a CENTRAL del estado real del Engine tras un (re)registro.
+
+    ¿Por qué es necesario?
+    Cuando el Monitor se vuelve a registrar (porque CENTRAL se reinició o la conexión
+    se cayó), CENTRAL parte del estado DESCONECTADA para esa estación. Pero el Engine
+    puede estar funcionando perfectamente: puede que haya un riego en curso, o que
+    haya una fuga activa. Sin esta función, CENTRAL tendría información obsoleta hasta
+    el próximo cambio de estado del Engine.
+
+    Esta función lee el estado interno del Monitor (engine_conectado y estado_fuga) y
+    publica los eventos Kafka correspondientes para que CENTRAL se actualice
+    inmediatamente tras el re-registro.
+    """
     with lock_estado:
         conectado, fuga = engine_conectado, estado_fuga
     if not conectado:
@@ -127,8 +191,20 @@ def sincronizar_estado_con_central(productor, id_ws):
 
 
 def mantener_enlace_central(cliente, ip_central, puerto_central, id_ws, ubicacion, productor):
-    """Hilo: manda un ENQ cada LATIDO_CENTRAL s y espera ACK. Si CENTRAL no responde
-    (se cayo o se reinicio), vuelve a registrar la estacion."""
+    """
+    Hilo que mantiene viva la conexion con CENTRAL enviando latidos ENQ periódicos.
+
+    Comportamiento:
+      - Cada LATIDO_CENTRAL segundos (5 s por defecto) envía ENQ y espera ACK (10 s máx).
+      - Si CENTRAL no responde (se reinició, red caída, etc.), cierra el socket
+        y vuelve a registrar la estación llamando a registrar_en_central().
+      - Después del re-registro, sincroniza el estado real del Engine con CENTRAL
+        para que no haya diferencia entre lo que sabe CENTRAL y lo que hay realmente.
+
+    ¿Qué pasa si CENTRAL no responde varios latidos seguidos?
+    Con timeout=10 s y LATIDO_CENTRAL=5 s, un fallo se detecta en ~15 s.
+    Entonces se reintenta el registro indefinidamente cada 5 s hasta reconectar.
+    """
     while True:
         time.sleep(LATIDO_CENTRAL)
         try:
@@ -174,7 +250,10 @@ def atender_engine(conn, addr, id_ws, ubicacion, productor):
             trama = recv_exact_frame(conn, timeout=HEARTBEAT_TIMEOUT)
             valido, respuesta = (False, "") if not trama else desempaquetar_trama(trama)
 
-            # CASO A: no hay respuesta o la trama es invalida -> se interpreta como averia.
+            # CASO A: sin respuesta (trama vacía = conexión cerrada) o trama inválida.
+            # Se interpreta como avería: el Engine no puede responder, algo va mal.
+            # Solo notificamos FUGA la primera vez (transición normal → fuga) para no
+            # saturar el topic Kafka con mensajes repetidos si el Engine sigue sin responder.
             if not trama or not valido:
                 # Sin respuesta: se interpreta como averia
                 with lock_estado:
@@ -190,7 +269,8 @@ def atender_engine(conn, addr, id_ws, ubicacion, productor):
                 time.sleep(HEARTBEAT_INTERVALO)
                 continue
 
-            # CASO B: el Engine responde KO (fuga simulada con la tecla 'k').
+            # CASO B: el Engine responde KO (fuga simulada con la tecla 'k' en la consola).
+            # Igual que el caso A: solo notificamos la transición normal → fuga.
             if respuesta == "KO":
                 with lock_estado:
                     if not estado_fuga:
@@ -199,7 +279,9 @@ def atender_engine(conn, addr, id_ws, ubicacion, productor):
                                         value={"id_ws": id_ws, "evento": "FUGA", "timestamp": time.time()})
                         productor.flush()
                         print(f"[MONITOR {id_ws}] >>> FUGA detectada por el Engine: notificada a CENTRAL.")
-            # CASO C: responde OK. Si antes habia fuga, se notifica que ya esta resuelta.
+            # CASO C: el Engine responde OK. Si antes había fuga, significa que la avería
+            # se ha resuelto: notificamos FUGA_RESUELTA para que CENTRAL vuelva a poner
+            # la estación en DISPONIBLE.
             elif respuesta == "OK":
                 with lock_estado:
                     if estado_fuga:
@@ -239,6 +321,11 @@ def servidor_para_engine(puerto_engine, id_ws, ubicacion, productor):
         productor.send(TOPIC_ESTADO_WS, key=id_ws,
                         value={"id_ws": id_ws, "evento": "CONECTADO", "timestamp": time.time()})
         productor.flush()
+        # atender_engine() es BLOQUEANTE: no vuelve hasta que el Engine se desconecta.
+        # Esto garantiza que cada Monitor gestiona como máximo UN Engine a la vez,
+        # lo que es el comportamiento correcto para una estación física: hay una sola
+        # electroválvula y un solo sensor de caudal. Cuando el Engine se desconecta,
+        # el bucle while vuelve a accept() para esperar una nueva conexión.
         atender_engine(conn, addr, id_ws, ubicacion, productor)  # bloqueante: 1 engine por WS
 
 

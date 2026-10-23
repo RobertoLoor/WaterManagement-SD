@@ -14,6 +14,22 @@ Responsabilidades:
    cumpla el tiempo establecido, se reciba orden de parar, o se detecte
    una fuga.
 
+Hilos del Engine:
+  hilo_monitor    : cliente TCP del Monitor. Recibe IDENTIDAD y contesta OK/KO a cada PING.
+                    Si pierde la conexión, reintenta cada 3 s (bucle de reconexión).
+  hilo_comandos   : consumidor Kafka del topic 'comandos-estacion'. Filtra por id_ws/ALL.
+                    Gestiona INICIAR_RIEGO, DETENER_RIEGO, RESET_CONTADOR, BLOQUEAR, ACTIVAR.
+  hilo_teclado    : lee sys.stdin en bucle. 'k' = simular fuga (KO), 'o' = resolverla (OK),
+                    'q' = salir limpiamente. Permite pruebas manuales sin necesidad de red.
+  hilo_auto_riego : (opcional) si AUTO_RIEGO_INTERVALO > 0, inicia riegos automáticos cada
+                    N segundos sin necesitar operario ni orden de CENTRAL. La estación se
+                    riega sola. Se puede desactivar con AUTO_RIEGO_INTERVALO=0 (defecto).
+  hilo_riego      : (uno por riego) manda telemetría cada 1 s a 'telemetria-riego' y termina
+                    con un mensaje RIEGO_FINALIZADO indicando el motivo de parada.
+
+Motivos de fin de riego: TIEMPO_AGOTADO, FUGA, BLOQUEO, MANUAL.
+Sincronización: threading.Event (banderas entre hilos) y Lock (proteger variables compartidas).
+
 Uso:
     python WM_WS_E.py <ip_monitor> <puerto_monitor> <kafka_broker>
 
@@ -73,22 +89,53 @@ from utils.kafka_utils import crear_productor, crear_consumidor, TOPIC_TELEMETRI
 # Identidad: la asigna el Monitor al conectar (al principio son None).
 id_ws = None
 ubicacion = None
-# en_fuga: fuga simulada con la tecla 'k' (hace que se conteste KO al PING).
-# fuera_de_servicio: bloqueada por CENTRAL (comando BLOQUEAR).
+
+# Booleano de estado: True cuando la fuga está activa (simulada con 'k').
+# Hace que hilo_monitor conteste KO al siguiente PING del Monitor.
+# El Monitor detecta KO y publica FUGA en Kafka hacia CENTRAL.
 en_fuga = False
+
+# Booleano de estado: True cuando CENTRAL ha enviado el comando BLOQUEAR.
+# Impide iniciar nuevos riegos y detiene el riego en curso si lo hubiera.
 fuera_de_servicio = False
+
+# Lock que protege en_fuga y fuera_de_servicio: varios hilos los leen y escriben.
 lock_estado = threading.Lock()   # protege los dos booleanos anteriores
 
-# riego_activo: bandera "hay un riego en curso". riego_stop_solicitado: orden de parar.
+# threading.Event de sincronización: se activa (set) cuando hay un riego en curso
+# y se desactiva (clear) cuando termina. Otros hilos pueden hacer .is_set() para
+# saber si hay riego sin necesitar un lock.
 riego_activo = threading.Event()
+
+# threading.Event de sincronización: hilo_comandos lo activa cuando recibe DETENER_RIEGO
+# o cuando se ejecuta BLOQUEAR. hilo_riego lo comprueba cada segundo y, si está activo,
+# para el riego con motivo "MANUAL" o "BLOQUEO" respectivamente.
 riego_stop_solicitado = threading.Event()
+
 volumen_acumulado = 0.0
 operario_actual = None
 
 
 # ---------------------------------------------------- enlace con Monitor --
 def hilo_monitor(ip_monitor, puerto_monitor, identidad_lista: threading.Event):
-    """Se conecta al Monitor, recibe su identidad y responde a los latidos (PING)."""
+    """
+    Se conecta al Monitor como cliente TCP y gestiona el handshake y los latidos.
+
+    Flujo:
+      1. Bucle de reconexión: si el Monitor no está disponible, reintenta cada 3 s.
+         Esto permite arrancar el Engine antes que el Monitor; se conectará en cuanto
+         el Monitor esté listo.
+      2. Handshake IDENTIDAD: al conectar, el Monitor envía la trama
+         IDENTIDAD#id_ws#ubicacion. El Engine la parsea y guarda id_ws y ubicacion
+         en las variables globales. Después activa el Event identidad_lista para
+         que hilo_comandos y hilo_auto_riego puedan empezar a trabajar.
+      3. Bucle de latidos PING/OK/KO: el Monitor envía tramas PING cada
+         HEARTBEAT_INTERVALO segundos. El Engine responde:
+           OK → todo normal (en_fuga es False).
+           KO → fuga activa (en_fuga es True, pulsada 'k' en consola).
+         Si no llega PING en 15 s (timeout), se asume que el Monitor cayó y
+         el bucle de reconexión vuelve a intentar conectar.
+    """
     global id_ws, ubicacion
     # Bucle externo: si se pierde la conexion, se reintenta cada 3 s (asi ves el
     # "Conexion con Monitor perdida ... Reintentando" mientras el Monitor no esta arrancado).
@@ -126,7 +173,20 @@ def hilo_monitor(ip_monitor, puerto_monitor, identidad_lista: threading.Event):
 
 
 def hilo_teclado():
-    """Permite simular una averia/fuga (k) o resolverla (o) desde consola."""
+    """
+    Lee comandos de la consola para simular averías o salir del Engine.
+
+    Teclas disponibles:
+      k + Enter → activa en_fuga=True: el Engine empieza a responder KO al PING.
+                  El Monitor detecta KO y notifica FUGA a CENTRAL.
+      o + Enter → desactiva en_fuga=False: el Engine vuelve a responder OK.
+                  El Monitor detecta el cambio y notifica FUGA_RESUELTA a CENTRAL.
+      q + Enter → termina el proceso completamente.
+
+    Usa sys.stdin en un bucle bloqueante (espera línea a línea), lo que permite
+    leer la entrada estándar sin consumir CPU (el OS notifica cuando hay datos).
+    Es la forma más sencilla de teclado en consola para un proceso de simulación.
+    """
     global en_fuga
     print("[ENGINE] Pulsa 'k' + Enter para simular una fuga, 'o' + Enter para resolverla.")
     # Recorre las lineas que el usuario escribe en la consola (bloquea esperando Enter).
@@ -147,7 +207,24 @@ def hilo_teclado():
 
 # ------------------------------------------------------------ riego -------
 def hilo_riego(productor, duracion_seg: int, operario: str):
-    """Simula el riego: abre la valvula y envia telemetria cada segundo."""
+    """
+    Simula el ciclo completo de un riego: apertura de válvula, telemetría y cierre.
+
+    Funcionamiento:
+      - Cada segundo genera un caudal aleatorio (10-25 L/min) y acumula el volumen.
+      - Fórmula del volumen: el caudal está en litros/minuto, pero se mide cada 1 segundo.
+        Por eso se divide entre 60: volumen_delta = caudal_lmin / 60 litros/segundo × 1 s.
+      - Envía un mensaje TELEMETRIA a Kafka cada segundo con el caudal y el volumen total.
+      - Al finalizar, envía un mensaje RIEGO_FINALIZADO con el resumen completo.
+
+    Condiciones de parada (orden de prioridad):
+      1. FUGA activa (en_fuga=True): el sistema de seguridad prevalece sobre todo.
+      2. BLOQUEO (fuera_de_servicio=True): orden de CENTRAL.
+      3. Parada manual (riego_stop_solicitado activo): orden de DETENER_RIEGO.
+      4. Tiempo agotado: se cumplió la duración solicitada.
+
+    El orden importa: una fuga durante un riego bloqueado reportará "FUGA", no "BLOQUEO".
+    """
     global volumen_acumulado, operario_actual
     # Preparacion: contador a 0, marcamos que hay riego en curso y limpiamos la orden de parar.
     volumen_acumulado = 0.0
@@ -180,6 +257,7 @@ def hilo_riego(productor, duracion_seg: int, operario: str):
 
         # Simulacion: caudal aleatorio 10-25 L/min. Como medimos cada segundo, el
         # volumen que se suma en ese segundo es caudal/60 litros.
+        # Ejemplo: 18 L/min -> 18/60 = 0.3 L en ese segundo.
         caudal = round(random.uniform(10.0, 25.0), 2)
         volumen_acumulado = round(volumen_acumulado + caudal / 60.0, 2)
 
@@ -206,10 +284,27 @@ def hilo_riego(productor, duracion_seg: int, operario: str):
 
 
 def hilo_auto_riego(productor, intervalo: int, duracion: int, identidad_lista: threading.Event):
-    """Inicia riegos automaticos cada 'intervalo' segundos si la estacion esta libre.
-    La estacion se riega sola sin necesitar operario ni orden de CENTRAL.
-    Activado cuando AUTO_RIEGO_INTERVALO > 0 (variable de entorno o argumento).
-    El operario que aparece en la telemetria es 'ESTACION' (auto-gestionado).
+    """
+    Inicia riegos automáticos periódicos sin intervención del operario ni de CENTRAL.
+
+    Esta función se activa solo cuando AUTO_RIEGO_INTERVALO > 0 (variable de entorno).
+    Permite simular una estación de riego autónoma que se riega sola según un horario.
+
+    Comportamiento:
+      - Espera a que hilo_monitor haya recibido la identidad (id_ws) del Monitor antes
+        de actuar: sin id_ws no se puede etiquetar la telemetría correctamente.
+      - Cada 'intervalo' segundos comprueba si las condiciones permiten regar.
+      - Condiciones para POSPONER el auto-riego (no se cancela, se reintenta en el
+        próximo ciclo):
+          * Hay una fuga activa (en_fuga=True): regar con fuga sería contraproducente.
+          * La estación está fuera de servicio (fuera_de_servicio=True): CENTRAL lo prohíbe.
+          * Ya hay un riego en curso (riego_activo.is_set()): no se superponen riegos.
+      - Si todo está bien, lanza hilo_riego en un hilo daemon con operario='ESTACION'.
+
+    :param productor:      KafkaProducer para publicar la telemetría.
+    :param intervalo:      Segundos entre auto-riegos (de AUTO_RIEGO_INTERVALO).
+    :param duracion:       Duración de cada auto-riego en segundos (de AUTO_RIEGO_DURACION).
+    :param identidad_lista:Event que se activa cuando se conoce el id_ws del Engine.
     """
     identidad_lista.wait()   # esperar a conocer id_ws antes de actuar
     print(f"[ENGINE {id_ws}] Auto-riego activado: cada {intervalo}s durante {duracion}s.")
@@ -238,7 +333,16 @@ def hilo_auto_riego(productor, intervalo: int, duracion: int, identidad_lista: t
 
 
 def hilo_comandos(kafka_broker, identidad_lista: threading.Event):
-    """Escucha los comandos que envia CENTRAL (iniciar/detener riego, bloquear, activar...)."""
+    """
+    Escucha los comandos que envia CENTRAL (iniciar/detener riego, bloquear, activar...).
+
+    Filtro por id_ws/ALL:
+    El topic 'comandos-estacion' es compartido por TODOS los Engines del sistema.
+    Cada Engine filtra los mensajes que le corresponden comparando el campo id_ws
+    del mensaje con su propio id_ws. Los mensajes con id_ws='ALL' se atienden siempre
+    (permiten enviar una orden a todas las estaciones a la vez, aunque no se usa
+    actualmente en la práctica).
+    """
     global fuera_de_servicio
     identidad_lista.wait()  # necesitamos conocer nuestro id_ws antes de filtrar comandos
 
@@ -325,7 +429,10 @@ if __name__ == "__main__":
 
     # Auto-riego autonomo de la estacion (sin operario ni CENTRAL):
     #   AUTO_RIEGO_INTERVALO: segundos entre riegos automaticos (0 = desactivado, defecto: 0).
+    #     Aumentar este valor reduce la frecuencia de riego.
+    #     Si se pone a 0, el hilo hilo_auto_riego no se crea.
     #   AUTO_RIEGO_DURACION : duracion de cada auto-riego en segundos (defecto: 30).
+    #     Debe ser menor que AUTO_RIEGO_INTERVALO para que no se solapen riegos consecutivos.
     auto_intervalo = int(os.getenv("AUTO_RIEGO_INTERVALO", "0"))
     auto_duracion  = int(os.getenv("AUTO_RIEGO_DURACION",  "30"))
 
