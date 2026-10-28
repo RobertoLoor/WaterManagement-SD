@@ -1,0 +1,13 @@
+protocol.py: Empaqueta y valida los mensajes de sockets TCP usando tramas con delimitadores <STX>/<ETX>, checksum de error <LRC> y señales de control (ENQ, ACK, NACK, EOT).
+
+  
+kafka_utils.py: Centraliza los nombres de todos los topics y crea productores y consumidores con reintentos automáticos para resistir caídas o retrasos del broker.
+
+  
+db.py: Gestiona la base de datos SQLite de forma segura entre múltiples hilos mediante un cerrojo (Lock), guardando el estado de estaciones, operarios y el historial de eventos.
+
+ 
+__init__.py: Convierte la carpeta utils en un paquete importable de Python para que todos los componentes puedan compartir su código.
+
+
+__pycache__: Es una carpeta que crea Python automáticamente para guardar el código precompilado en bytecode (.pyc), haciendo que los programas arranquen más rápido en las siguientes ejecuciones.

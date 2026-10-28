@@ -1,0 +1,13 @@
+WM_Central.py: Es el núcleo del sistema que coordina la red mediante 6 hilos concurrentes, gestionando el registro por sockets de los Monitores, los comandos y telemetría por Kafka, y el guardado en base de datos.
+
+  
+dashboard.py: Es el servidor web en Flask que expone las rutas REST (/api/state y /api/action) para que el navegador pueda consultar y controlar las estaciones en tiempo real.
+
+  
+Dockerfile: Instrucciones de Docker para empaquetar y ejecutar WM_Central dentro de un contenedor aislado tanto en local como en Railway.
+
+  
+templates/dashboard.html: Es la interfaz visual web (HTML, CSS y JavaScript) que dibuja la tabla de estaciones con sus colores de estado y los botones de acción (Regar, Bloquear, Activar).
+
+  
+__pycache__: Carpeta generada automáticamente por Python con el bytecode precompilado (.pyc) de WM_Central para agilizar el arranque del servidor.

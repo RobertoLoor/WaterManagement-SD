@@ -1,0 +1,13 @@
+﻿WM_FO.py: Es la aplicación para operarios de campo que permite consultar el estado de la red por broadcast y solicitar riegos mediante menú interactivo o por lotes de forma automática.
+
+  
+activaciones_ejemplo.json: Es un plan de riego de ejemplo en formato JSON que programa órdenes de riego secuenciales respetando una pausa obligatoria de 4 segundos entre cada una.
+
+  
+activaciones/: Carpeta que contiene los planes de riego dedicados en formato JSON para las pruebas simultáneas de los operarios FO-01 hasta FO-15.
+
+  
+Dockerfile: Es la receta de Docker para empaquetar y ejecutar el operario de campo dentro de un contenedor interactivo.
+
+  
+__pycache__: Carpeta generada automáticamente por Python con el bytecode precompilado (.pyc) para agilizar el arranque de la aplicación del operario.

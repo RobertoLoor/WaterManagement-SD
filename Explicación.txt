@@ -1,0 +1,46 @@
+.dockerignore: Especifica los archivos y carpetas locales (como .git, entornos virtuales .venv y __pycache__) que Docker debe ignorar al construir las imagenes para que sean mas rapidas y ligeras.
+
+
+.env.lab.example: Plantilla de variables de entorno con las direcciones IP, puertos y configuraciones necesarias para desplegar las estaciones y operarios en el laboratorio o en varias maquinas.
+
+
+.gitignore: Define que ficheros no deben subirse a Git (bases de datos SQLite .db, ejecutables temporales, carpetas de dependencias y archivos compilados .pyc).
+
+
+docker-compose.yml: Archivo de orquestacion de Docker que levanta de forma automatica el broker Apache Kafka en modo KRaft y WM_Central para pruebas locales en una sola maquina.
+
+
+docker-compose.lab.yml: Configuracion de Docker Compose preparada para el entorno de laboratorio, permitiendo arrancar estaciones de riego y operarios de campo conectados a la nube.
+
+
+requirements.txt: Lista de librerias externas de Python que necesita el proyecto para funcionar (como kafka-python-ng y Flask), listas para instalar con pip.
+
+
+README.md: Portada y presentacion general del repositorio en GitHub, con los autores, componentes del sistema y aclaraciones esenciales de arquitectura.
+
+
+MEMORIA.md: Documento tecnico extenso que detalla la arquitectura distribuida, el modelo de hilos, los protocolos de comunicacion y las justificaciones de diseno de la practica.
+
+
+GUIA_USO.md: Manual de usuario paso a paso que ensena a compilar, configurar y ejecutar el sistema completo en local, en Windows sin Docker, y en Railway/Laboratorio.
+
+
+Nombres.txt: Fichero de texto que acredita la autoria e integrantes del grupo de practicas de Sistemas Distribuidos.
+
+
+WM_Central/: Carpeta que contiene el nucleo de control del sistema (servidor de sockets TCP, consumidor/productor Kafka, persistencia SQLite y panel web Flask).
+
+
+WM_WS/: Carpeta de las estaciones de riego, compuesta por el supervisor de red (Monitor) y el actuador de valvula y telemetria (Engine).
+
+
+WM_FO/: Carpeta de la aplicacion para los operarios de campo (Field Operator) y sus ficheros JSON con planes de riego automaticos.
+
+
+utils/: Carpeta de utilidades compartidas que incluye el protocolo de tramas TCP con checksum LRC, los conectores de Kafka y la base de datos.
+
+
+scripts/: Conjunto de scripts (.bat y .ps1) para arrancar facilmente componentes individuales o pruebas masivas con decenas de estaciones en Windows.
+
+
+Documentos de interes/: Carpeta con documentacion complementaria del proyecto y registro de consultas tecnicas.

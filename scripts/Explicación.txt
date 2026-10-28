@@ -1,0 +1,16 @@
+setup_windows.bat: Crea el entorno virtual e instala las librerías necesarias de Python sin pedir permisos de administrador.
+
+  
+run_central_windows.bat: Arranca la Central (sockets, Kafka y panel web) en local directamente con Python sin usar Docker.
+
+  
+run_ws_windows.bat: Abre dos ventanas para iniciar una estación completa (un Monitor para registrarse y un Engine para regar y simular fugas).
+
+  
+run_fo_windows.bat: Abre la consola de un operario para consultar estaciones o pedir riegos mediante un menú interactivo.
+
+  
+run_multi_ws_windows.ps1: Levanta de golpe 20 estaciones de riego (40 ventanas CMD) para llenar el panel web y hacer pruebas a gran escala.
+
+  
+run_multi_fo_windows.ps1: Lanza a la vez 15 operarios que ejecutan sus planes de riego JSON de forma 100% automática y desatendida.

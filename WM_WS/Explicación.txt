@@ -1,0 +1,13 @@
+﻿WM_WS_E.py: Es el actuador de la estación que simula la electroválvula, calcula y envía telemetría de caudal y volumen por Kafka, ejecuta órdenes de riego y permite simular fugas con el teclado ('k' y 'o').
+
+  
+WM_WS_M.py: Es el supervisor de la estación que se registra en Central por sockets TCP, vigila la salud del Engine mediante pings de latido cada segundo y notifica averías (fugas) a Central.
+
+  
+Dockerfile.engine: Es la receta de Docker para empaquetar y ejecutar el actuador (Engine) en un contenedor con consola interactiva.
+
+  
+Dockerfile.monitor: Es la receta de Docker para empaquetar y ejecutar el supervisor (Monitor) en un contenedor en segundo plano.
+
+  
+__pycache__: Carpeta generada automáticamente por Python con el bytecode precompilado (.pyc) para agilizar el arranque de los componentes de la estación.

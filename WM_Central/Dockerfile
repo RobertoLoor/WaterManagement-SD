@@ -1,17 +1,13 @@
-# Imagen base: Python 3.11 en su version "slim" (Debian minimo, imagen ligera).
 FROM python:3.11-slim
  
 # Carpeta de trabajo dentro del contenedor; los comandos siguientes se ejecutan aqui.
 WORKDIR /app
  
-# Copiamos primero SOLO requirements.txt e instalamos dependencias. Docker guarda cada
-# paso en cache: si el codigo cambia pero requirements.txt no, este paso no se repite
-# y el build es mucho mas rapido.
+# Copiamos primero SOLO requirements.txt e instalamos dependencias. Docker guarda cada paso en cache: si el codigo cambia pero requirements.txt no, este paso no se repite y el build es mucho mas rapido.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
  
 # Copiamos todo el proyecto para disponer de utils/
-# (el contexto de build es la raiz del repo, por eso hay acceso a utils/ y a WM_Central/).
 COPY . .
  
  
